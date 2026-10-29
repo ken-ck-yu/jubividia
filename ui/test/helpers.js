@@ -198,10 +198,19 @@ export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 /** Upload a tiny valid image and return its server-generated key. */
 export async function uploadImage() {
-  const res = await send("/api/upload?kind=image&ext=jpg", { method: "PUT", body: JPEG, headers: { "Content-Type": "image/jpeg" } });
+  const res = await send("/api/upload?kind=image&ext=jpg", {
+    method: "PUT",
+    body: JPEG,
+    headers: { "Content-Type": "image/jpeg", "Content-Length": String(JPEG.byteLength) },
+  });
   return (await res.json()).upload_key;
 }
 export async function uploadVideo() {
-  const res = await send("/api/upload?kind=video&ext=mp4", { method: "PUT", body: mp4Bytes(), headers: { "Content-Type": "video/mp4" } });
+  const body = mp4Bytes();
+  const res = await send("/api/upload?kind=video&ext=mp4", {
+    method: "PUT",
+    body,
+    headers: { "Content-Type": "video/mp4", "Content-Length": String(body.byteLength) },
+  });
   return (await res.json()).upload_key;
 }
