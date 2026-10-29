@@ -164,7 +164,32 @@ def test_input_key_rejected(key):
 
 def test_size_rounded_down_to_32():
     p = handler.validate_input(v(width=1000, height=721))
-    assert (p["width"], p["height"]) == (992, 704)
+    assert (p["width"], p["height"]) == (960, 704)
+
+
+@pytest.mark.parametrize("w,h", [(256, 256), (300, 319), (1280, 720), (2048, 2047)])
+def test_size_multiple_of_64_and_never_below_256(w, h):
+    p = handler.validate_input(v(width=w, height=h))
+    assert p["width"] % 64 == 0 and p["height"] % 64 == 0
+    assert p["width"] >= 256 and p["height"] >= 256
+
+
+def test_size_below_minimum_rejected():
+    assert code_of(v(width=255)) == "bad_input"
+    assert code_of(v(height=63)) == "bad_input"
+
+
+@pytest.mark.parametrize("kw", [dict(num_frames=25), dict(duration=1, fps=24), dict(duration=0.3)])
+def test_v2v_min_frames_rejected(kw):
+    with pytest.raises(handler.JobError) as e:
+        handler.validate_input(v(mode="v2v", input_key="inputs/a.mp4", **kw))
+    assert e.value.code == "bad_input" and "33" in e.value.message
+
+
+def test_v2v_min_frames_boundary_and_other_modes_unaffected():
+    assert handler.validate_input(v(mode="v2v", input_key="inputs/a.mp4", num_frames=33))["num_frames"] == 33
+    assert handler.validate_input(v(num_frames=9))["num_frames"] == 9
+    assert handler.validate_input(v(mode="i2v", input_key="inputs/a.png", num_frames=25))["num_frames"] == 25
 
 
 def test_input_key_ok():

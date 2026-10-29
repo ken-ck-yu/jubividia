@@ -23,7 +23,7 @@ CI (`.github/workflows/build-worker.yml`) builds and pushes `ghcr.io/ken-ck-yu/l
 
 ### Job contract (v1)
 
-Input: `mode` (`t2v`/`i2v`/`v2v`), `prompt`, optional `negative`, `input_key` (an R2 key under `inputs/`, required for i2v/v2v; no URLs are accepted), `width`/`height` (default 1280x720; rounded down to a multiple of 32, so 720 becomes 704 and the effective size is returned), `duration` seconds (default 5) with `fps` (default 24) or an explicit `num_frames` (8k+1, default 121). `duration` x `fps` and `num_frames` share one maximum of 481 frames. `seed` is optional.
+Input: `mode` (`t2v`/`i2v`/`v2v`), `prompt`, optional `negative`, `input_key` (an R2 key under `inputs/`, required for i2v/v2v; no URLs are accepted), `width`/`height` (default 1280x720; 256 to 2048, rounded down to a multiple of 64 because the two-stage graph halves the size, so 720 becomes 704 and the effective size is returned), `duration` seconds (default 5) with `fps` (default 24) or an explicit `num_frames` (8k+1, default 121). For v2v the resulting frame count must be at least 33 (the guide uses the last 25 frames of the input), otherwise `bad_input`. `duration` x `fps` and `num_frames` share one maximum of 481 frames. `seed` is optional.
 
 Output: `{v, key, thumb_key, meta_key, duration_s, gen_time_s, seed, width, height, num_frames, fps, cold}`. R2 keys are `outputs/<YYYY-MM-DD>/<YYYYMMDDTHHMMSS>-<job_id>.mp4|.jpg|.json`; the `.json` sidecar holds the prompt and parameters. The timestamp is taken when the job starts, so a retried job gets new keys: the UI must not assume a retry overwrites the earlier result.
 

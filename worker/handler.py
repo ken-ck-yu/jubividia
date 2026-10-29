@@ -7,7 +7,7 @@ Input (job["input"]):
     prompt      non-empty str                                required
     negative    str                                          optional
     input_key   R2 key under "inputs/"                       required for i2v/v2v
-    width, height   256..2048, rounded down to a multiple of 32
+    width, height   256..2048, rounded down to a multiple of 64
                                                              default 1280x720 (-> 1280x704)
     duration    seconds (float)                              default 5
     fps         1..60                                        default 24
@@ -68,6 +68,7 @@ POLL_INTERVAL_S = float(os.environ.get("POLL_INTERVAL_S", "1.0"))
 UPLOAD_TRIES = 3
 UPLOAD_BACKOFF_S = 1.0
 MAX_FRAMES = 481
+V2V_MIN_FRAMES = 33  # v2v guide takes the last 25 frames; FRAMES must exceed 25
 
 MODES = ("t2v", "i2v", "v2v")
 DEFAULTS = {"width": 1280, "height": 720, "duration": 5.0, "fps": 24}
@@ -164,9 +165,10 @@ def validate_input(inp):
 
     width = _int(inp, "width", DEFAULTS["width"], 256, 2048)
     height = _int(inp, "height", DEFAULTS["height"], 256, 2048)
-    # LTX needs multiples of 32; 720 is not one, so round DOWN (720 -> 704) and
-    # report the effective size in the output.
-    width, height = width // 32 * 32, height // 32 * 32
+    # The two-stage graph halves the size, so multiples of 64 keep the stage-1
+    # latent a multiple of 32. Round DOWN (720 -> 704) and report the effective
+    # size in the output. The 256 minimum guarantees a result of at least 256.
+    width, height = width // 64 * 64, height // 64 * 64
     fps = _int(inp, "fps", DEFAULTS["fps"], 1, 60)
 
     if inp.get("num_frames") is not None:
@@ -184,6 +186,13 @@ def validate_input(inp):
                 f"duration x fps gives {num_frames} frames; the maximum is {MAX_FRAMES} "
                 f"(about {MAX_FRAMES / fps:.1f} s at {fps} fps)",
             )
+
+    if mode == "v2v" and num_frames < V2V_MIN_FRAMES:
+        raise JobError(
+            "bad_input",
+            f"v2v needs at least {V2V_MIN_FRAMES} frames (got {num_frames}); "
+            "the guide uses the last 25 frames of the input video",
+        )
 
     seed = _int(inp, "seed", None, 0, 2**53)
     if seed is None:
