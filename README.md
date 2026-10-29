@@ -153,7 +153,7 @@ Environment variables are documented in [`config.env.example`](config.env.exampl
 
 `infra/runpod/apply.sh` creates and verifies the RunPod resources from `config.env`: the network volume, the two R2 secrets, the serverless endpoint and the temporary model-download pod. It is a bash script over the RunPod REST API (no maintained Terraform provider covers endpoints, volumes and secrets). It is idempotent (re-running makes no create calls), supports `--dry-run` (reads only), writes the ids back to `config.env`, never prints secret values, refuses to run under `bash -x`, and has **no code path that deletes the volume or the two R2 secrets**. A read-back mismatch is fixed by patching the one differing field; the script never deletes an endpoint on its own (only `teardown-endpoint --yes` does).
 
-> **Unverified without a real call:** the REST base URL (`RUNPOD_API_BASE`, default `https://rest.runpod.io/v1`) and the exact route and field names (`/network-volumes`, `/secrets`, `/endpoints`, `/pods`, `cmd`, `mounts`, ...) follow the design note, not a live check. Run `apply.sh preflight` first (read-only); fix any 4xx from it before anything billable. The routes are plain string literals in `infra/runpod/apply.sh`.
+> **API contract:** the tool follows RunPod's public v2 OpenAPI document: server `https://api.runpod.io`, every route under `/v2` (`RUNPOD_API_BASE`, default `https://api.runpod.io/v2`), bearer auth. Routes used: `/account/secrets`, `/network-volumes`, `/serverless`, `/pods` (+ `/{id}`, `/pods/{id}/logs`). Not checkable without a real call: live behaviour, quotas and balance. Run `apply.sh preflight` first (read-only).
 
 ### Setup from zero (endpoint)
 
