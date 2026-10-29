@@ -454,6 +454,10 @@ class H(BaseHTTPRequestHandler):
         fl = S["flags"]
         job["polls"] += 1
         inp = job["input"]
+        if fl.get("status_fail") and job["polls"] > int(fl.get("status_fail_after", 0)):
+            if fl["status_fail"] == "garbage":
+                return self.send(200, raw=b"<html>not json</html>", ctype="text/html")
+            return self.problem(int(fl["status_fail"]), "simulated /status failure")
         if fl.get("stuck"):
             return self.send(200, {"id": jid, "status": "IN_PROGRESS"})
         if job["polls"] == 1:

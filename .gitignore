@@ -6,6 +6,7 @@ config.env
 *.gguf
 node_modules/
 .wrangler/
+config.env.tmp.*
 __pycache__/
 .wf-validate/
 *.pyc

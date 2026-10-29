@@ -2,6 +2,7 @@
 # Offline tests for infra/runpod/apply.sh and scripts/smoke-job.sh against a fake
 # RunPod REST/runtime server on 127.0.0.1. No RunPod, Cloudflare or other network access.
 #   make -f infra/runpod/infra.mk test-infra
+# shellcheck disable=SC1087,SC2016,SC2034  # SC1087: "$E['x']" is a shell variable followed by a Python subscript inside a string handed to python; SC2016: single quotes keep literal $ / backticks on purpose (injection tests, grep patterns); SC2034: seq loop only counts
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -88,7 +89,7 @@ A() {
 }
 SM() {
   CONFIG_ENV="$T/config.env" RUNPOD_RUN_BASE="http://127.0.0.1:$PORT/rt" SMOKE_POLL_S=0.05 SMOKE_CSV="$T/t.csv" \
-    SMOKE_IDLE_WAIT_S=20 TMPDIR="$T/tmp" PATH="$SHIM:$PATH" bash "$SMOKE" "$@"
+    SMOKE_IDLE_WAIT_S=20 TMPDIR="$T/tmp" PATH="$SHIM:$PATH" timeout 120 bash "$SMOKE" "$@"
 }
 
 full_apply() { A volume >/dev/null 2>&1 && A secrets >/dev/null 2>&1 && A endpoint >/dev/null 2>&1; }
@@ -99,7 +100,7 @@ for f in "$APPLY" "$ROOT/infra/runpod/lib.sh" "$SMOKE" "$HERE/run.sh"; do
 done
 python3 -I -m py_compile "$ROOT/infra/runpod/rpjson.py" "$HERE/fake_runpod.py"; t "py_compile" 0 $?
 if command -v shellcheck >/dev/null; then
-  shellcheck -x -e SC1091 "$APPLY" "$ROOT/infra/runpod/lib.sh" "$SMOKE"; t "shellcheck" 0 $?
+  shellcheck -x -e SC1091 "$APPLY" "$ROOT/infra/runpod/lib.sh" "$SMOKE" "$HERE/run.sh"; t "shellcheck" 0 $?
 else
   echo "note: shellcheck not installed, skipped"
 fi
@@ -162,6 +163,32 @@ done
 out=$(env -u RUNPOD_API_BASE CONFIG_ENV="$T/config.env" bash "$APPLY" status 2>&1); rc=$?
 t "test mode refuses the real default base" 4 "$rc"
 t "refused runs sent no request" 0 "$(ctl log | pj 'len(d)')"
+# userinfo and other odd URLs must not pass the loopback check (curl would use the host after '@')
+ODD_URLS=(
+  'http://127.0.0.1:80@evil.invalid/v2'
+  'http://127.0.0.1:x@host/'
+  'http://127.0.0.1:9#@host/'
+  'http://127.0.0.1:9@api.runpod.io/v2'
+  'http://127.0.0.1:9\@host/'
+  'http://127.0.0.1:9 @host/'
+  'http://127.0.0.1/v2'
+  'http://127.0.0.1:/v2'
+  'http://127.0.0.1:9.evil.invalid/v2'
+  'http://127.0.0.1:9?x=@host'
+  'HTTP://127.0.0.1:9/v2'
+  'https://127.0.0.1:9/v2'
+  'http://localhost:9/v2'
+  'http://127.0.0.2:9/v2'
+  'http://[::1]:9/v2'
+  'http://127.0.0.1:9/v2/%0d%0a@host'
+)
+for u in "${ODD_URLS[@]}"; do
+  out=$(env RUNPOD_API_BASE="$u" CONFIG_ENV="$T/config.env" bash "$APPLY" status 2>&1); rc=$?
+  t "odd URL refused: $u" 4 "$rc"
+done
+t "odd URLs sent no request" 0 "$(ctl log | pj 'len(d)')"
+out=$(A status 2>&1); t "a plain loopback URL still works" 0 $?
+t "test-mode curl traffic bypasses proxies" 1 "$(grep -c -e '--noproxy' "$T/argv.log" | awk '{print ($1>=1)?1:0}')"
 
 # ---------------------------------------------------------------- 2. image tag validation
 new_fake
@@ -325,8 +352,19 @@ ctl clearlog >/dev/null
 out=$(A volume 2>&1); rc=$?
 tnz "shrink refused" "$rc"; tc "shrink message" "$out" "refusing to shrink"; t "shrink made no writes" 0 "$(writes)"
 mkcfg "RUNPOD_VOLUME_GB=120" "RUNPOD_NETWORK_VOLUME_ID=$VOL"
-A volume >/dev/null 2>&1
-t "grow works" 120 "$(state "d['volumes']['$VOL']['size']")"
+ctl clearlog >/dev/null
+out=$(A volume 2>&1); rc=$?
+tnz "grow without --yes refused" "$rc"; tc "grow refusal message" "$out" "--yes"; t "refused grow made no writes" 0 "$(writes)"
+A volume --yes >/dev/null 2>&1
+t "grow works with --yes" 120 "$(state "d['volumes']['$VOL']['size']")"
+# id from config must be the right DC and tier
+ctl_tamper "{\"kind\":\"volumes\",\"id\":\"$VOL\",\"patch\":{\"dataCenter\":\"EU-RO-1\"}}"
+out=$(A volume --yes 2>&1); rc=$?
+tnz "config volume id in the wrong DC refused" "$rc"; tc "wrong DC message" "$out" "expected US-WA-1"
+ctl_tamper "{\"kind\":\"volumes\",\"id\":\"$VOL\",\"patch\":{\"dataCenter\":\"US-WA-1\",\"type\":\"HIGH_PERFORMANCE\"}}"
+out=$(A volume --yes 2>&1); rc=$?
+tnz "config volume id with the wrong tier refused" "$rc"
+t "the kill hook is gated on test mode" 1 "$(grep -c 'RUNPOD_TEST_MODE == 1 && .*APPLY_TEST_KILL' "$APPLY")"
 # two volumes with the same name+DC: stop
 new_fake
 ctl_tamper '{"kind":"volumes","add":{"id":"vol-a","name":"jubividia-ltx-us-wa1","size":80,"dataCenter":"US-WA-1","type":"STANDARD"}}'
@@ -494,7 +532,61 @@ t "canary stop ran no model job" 0 "$(ctl log | pj 'len([x for x in d if x["path
 
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"no_error_code":true}'
 out=$(SM --no-r2-check 2>&1); rc=$?
-t "missing error_code -> gate fail" 1 "$rc"; tc "error_code message" "$out" "no error_code field"
+t "missing error_code with [input_fetch] prefix -> canary passes" 0 "$rc"
+tc "missing error_code is recorded as a note" "$out" "no separate error_code field"
+t "gate ran all jobs after the noted canary" 6 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"canary_error":"[config_error] worker misconfigured: R2_ACCESS_KEY_ID not set","no_error_code":true}'
+out=$(SM --no-r2-check 2>&1); rc=$?
+t "other prefix at canary -> stop" 3 "$rc"; tc "other-prefix message" "$out" "STOP AND ASK KEN"
+t "other prefix: only the canary job ran" 1 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"canary_error":"could not fetch input: 403"}'
+out=$(SM --no-r2-check 2>&1); rc=$?
+t "canary without any prefix -> stop" 3 "$rc"
+
+# F1: /status that keeps failing can never loop forever
+for mode in 500 401 garbage; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set "{\"status_fail\":\"$mode\"}"
+  out=$(SMOKE_POLL_FAIL_LIMIT=3 SM --no-r2-check 2>&1); rc=$?
+  t "/status $mode forever -> stop (not a hang)" 3 "$rc"
+  tc "/status $mode message" "$out" "failed 3 polls in a row"
+  t "/status $mode: cancel sent" 1 "$(count_calls POST /rt/ep-1/cancel | awk '{print ($1>=1)?1:0}')"
+done
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"status_fail":"500","status_fail_after":2}'
+out=$(SMOKE_POLL_FAIL_LIMIT=1000 SMOKE_MAX_INPROGRESS_S=1 SM --no-r2-check 2>&1); rc=$?
+t "in-progress cap still fires while /status fails" 3 "$rc"; tc "cap message while failing" "$out" "stayed IN_PROGRESS"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"status_fail":"500","unhealthy":1}'
+out=$(SMOKE_POLL_FAIL_LIMIT=1000 SM --no-r2-check 2>&1); rc=$?
+t "unhealthy check still fires while /status fails" 3 "$rc"; tc "unhealthy while failing" "$out" "Unhealthy"
+
+# Q10: overall spend guard
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check --max-spend 0.00001 2>&1); rc=$?
+t "spend cap reached -> stop" 3 "$rc"; tc "spend cap message" "$out" "reached --max-spend"
+out=$(SM --no-r2-check --max-spend lots 2>&1); rc=$?
+tnz "bad --max-spend rejected" "$rc"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check 2>&1); tc "summary reports estimated spend" "$out" "estimated spend: \$"
+tc "summary shows the default cap" "$out" "cap \$1.50"
+
+# Q4: no pinned image tag, no gate
+for bad in "" latest; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1" "IMAGE_TAG=$bad"
+  out=$(SM --no-r2-check 2>&1); rc=$?
+  tnz "smoke refuses IMAGE_TAG '$bad'" "$rc"
+  t "smoke with IMAGE_TAG '$bad' sent no job" 0 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+done
+
+# Q6: the run URL comes from the endpoint's requestUrls
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"http://127.0.0.1:$PORT/rt/alt-ep/run\"}}}"
+out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
+t "gate runs against requestUrls" 0 "$rc"
+t "jobs went to the requestUrls endpoint" 1 "$(ctl log | pj 'int(any(x["path"]=="/rt/alt-ep/run" for x in d) and not any(x["path"]=="/rt/ep-1/run" for x in d))')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"https://api.runpod.ai/v2/ep-1/run\"}}}"
+out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
+t "non-loopback requestUrls refused in test mode" 4 "$rc"
 
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"default_gen":[310.0]}'
 out=$(SM --no-r2-check 2>&1); rc=$?
@@ -515,11 +607,11 @@ if [[ ${FAKE_NO_AUDIO-} == 1 ]]; then echo '{"streams":[{"codec_type": "video"}]
 EOF
 chmod +x "$T/stubs/aws" "$T/stubs/ffprobe"
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; rm -f "$T/t.csv"
-out=$(PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
+out=$(SMOKE_ALLOW_STUB_AWS=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
 t "gate with R2/audio checks passes" 0 "$rc"; tc "audio present" "$out" "audio stream: present"; tc "R2 head ok" "$out" "R2 ok: outputs/"
 tc "csv records audio" "$(cat "$T/t.csv")" ",yes"
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
-out=$(FAKE_NO_AUDIO=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
+out=$(SMOKE_ALLOW_STUB_AWS=1 FAKE_NO_AUDIO=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
 t "silent mp4 (no audio stream) fails the gate" 1 "$rc"; tc "no audio message" "$out" "no audio stream"
 for s in "${SENTINELS[@]}"; do tn "R2 gate output has no $s" "$out" "$s"; done
 
