@@ -648,3 +648,75 @@ def test_sampler_is_stopped_when_generation_fails(env, monkeypatch):
     assert out["error_code"] == "timeout"
     assert len(created) == 1
     assert created[0]._stop.is_set() and not created[0]._t.is_alive()
+
+
+# ---- repeat of an identical request (ComfyUI cache) ----------------------
+def _cache_wf():
+    wf = json.loads(json.dumps(WF))
+    wf["9"] = {"class_type": "SaveVideo", "_meta": {"title": "OUTPUT"},
+               "inputs": {"filename_prefix": "video/LTX_2.5_t2v_wf1", "format": "mp4"}}
+    return wf
+
+
+def _install_caching_comfy(env, monkeypatch):
+    """Fake ComfyUI: a save node whose prefix was already used is served from cache,
+    executes nothing and reports no outputs (the real 'Prompt executed in 0.01 seconds')."""
+    seen, prefixes, state = set(), [], {}
+
+    def request(method, url, json=None, timeout=None):
+        if url.endswith("/prompt"):
+            prefix = json["prompt"]["9"]["inputs"]["filename_prefix"]
+            prefixes.append(prefix)
+            if prefix in seen:
+                state["history"] = {"pid": {"status": {"status_str": "success", "completed": True},
+                                            "outputs": {}}}
+            else:
+                seen.add(prefix)
+                name = prefix.replace("/", "_") + "_00001_.mp4"
+                (env.comfy / "output" / name).write_bytes(b"mp4data")
+                state["history"] = {"pid": {"status": {"status_str": "success", "completed": True},
+                                            "outputs": {"9": {"images": [{"filename": name, "subfolder": "",
+                                                                         "type": "output"}]}}}}
+            return Resp(200, {"prompt_id": "pid"})
+        if "/history/" in url:
+            return Resp(200, state.get("history", {}))
+        return Resp(200, {})
+
+    monkeypatch.setattr(handler.requests, "request", request)
+    for m in handler.MODES:
+        (env.wfdir / f"{m}.json").write_text(__import__("json").dumps(_cache_wf()))
+    return prefixes
+
+
+def test_identical_request_twice_gives_two_successful_jobs(env, monkeypatch):
+    prefixes = _install_caching_comfy(env, monkeypatch)
+    req = v(prompt="same prompt", seed=42, width=256, height=256, num_frames=25)
+    a = handler.handler({"id": "job-1", "input": dict(req)})
+    b = handler.handler({"id": "job-2", "input": dict(req)})
+    assert "error" not in a and "error" not in b, (a, b)
+    assert a["key"] != b["key"]
+    assert len(set(prefixes)) == 2
+
+
+def test_retry_with_the_same_job_id_also_gets_a_new_prefix(env, monkeypatch):
+    prefixes = _install_caching_comfy(env, monkeypatch)
+    req = v(prompt="same prompt", seed=42)
+    a = handler.handler({"id": "same-id", "input": dict(req)})
+    b = handler.handler({"id": "same-id", "input": dict(req)})
+    assert "error" not in a and "error" not in b, (a, b)
+    assert len(set(prefixes)) == 2
+
+
+def test_prefix_keeps_version_marker_and_is_filename_safe(env, monkeypatch):
+    prefixes = _install_caching_comfy(env, monkeypatch)
+    out = handler.handler({"id": "../we ird/id", "input": v()})
+    assert "error" not in out
+    p = prefixes[0]
+    assert p.startswith("video/LTX_2.5_t2v_wf1_")
+    assert re.fullmatch(r"video/[A-Za-z0-9._]+", p), p
+    assert ".." not in p
+
+
+def test_fill_workflow_without_suffix_leaves_prefix_alone():
+    wf = handler.fill_workflow(_cache_wf(), handler.validate_input(v()), None)
+    assert wf["9"]["inputs"]["filename_prefix"] == "video/LTX_2.5_t2v_wf1"
