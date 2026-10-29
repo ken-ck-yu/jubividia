@@ -2,10 +2,15 @@
 # Download the LTX-2.5 model files onto the RunPod network volume.
 # Source of truth for what to fetch: scripts/models.lock (pinned HF commit + sha256).
 # Run on a temporary pod with the volume attached. See README "Models".
-# Dependencies: bash 4.3+, curl 7.71+, sha256sum, coreutils (python3 only for
+# Dependencies: bash 5.0+ (uses 'local -'), flock (util-linux), curl 7.71+, sha256sum, coreutils (python3 only for
 # --update-lock and workflow JSON validation).
 # HF_TOKEN is read from the environment only and is never printed or logged.
 set -euo pipefail
+
+if ((BASH_VERSINFO[0] < 5)); then
+  echo "[models] ERROR: bash 5.0+ is required (found $BASH_VERSION). Ubuntu 22.04 pod images ship bash 5.1." >&2
+  exit 1
+fi
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -15,6 +20,7 @@ HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
 HF_ENDPOINT=${HF_ENDPOINT%/}
 FREE_SLACK_BYTES=${FREE_SLACK_BYTES:-5000000000}
 JOBS=${JOBS:-2}
+NO_LOCK=${NO_LOCK:-0}
 CURL_RETRY_DELAY=${CURL_RETRY_DELAY:-2}
 VOLUME_ROOT=${VOLUME_ROOT:-}
 
@@ -46,14 +52,14 @@ Options:
                        exists, else /workspace).
   --rev REV            With --update-lock: pin a different HF revision.
   --dry-run            With --prune: only list what would be removed.
+  --no-lock            (or NO_LOCK=1) Skip the per-volume run lock, e.g. if the volume
+                       filesystem does not support flock. Supervised single run only.
   -h, --help
 
 Environment: HF_TOKEN (read-only token; env only), HF_ENDPOINT, VOLUME_ROOT,
 SKIP_MOUNT_CHECK=1 (escape hatch if the mountpoint check wrongly fails on a pod).
 EOF
 }
-
-[[ $JOBS =~ ^[1-9][0-9]*$ ]] || die "JOBS must be an integer >= 1 (got '$JOBS')"
 
 while (($#)); do
   case $1 in
@@ -64,6 +70,7 @@ while (($#)); do
     --list) ACTION=list ;;
     --with-lora) WITH_LORA=1 ;;
     --dry-run) DRY_RUN=1 ;;
+    --no-lock) NO_LOCK=1 ;;
     --volume-root) (($# >= 2)) || die "--volume-root needs a value"; VOLUME_ROOT=$2; shift ;;
     --volume-root=*) VOLUME_ROOT=${1#*=} ;;
     --rev) (($# >= 2)) || die "--rev needs a value"; REV_OVERRIDE=$2; shift ;;
@@ -72,6 +79,8 @@ while (($#)); do
   esac
   shift
 done
+
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || die "JOBS must be an integer >= 1 (got '$JOBS')"
 
 # ---------------------------------------------------------------- lock parsing
 LOCK_REPO="" LOCK_REV="" LOCK_REV_DATE=""
@@ -171,12 +180,23 @@ resolve_volume() {
 # so it also covers two pods). Held until the script exits.
 acquire_run_lock() {
   mkdir -p "$MODELS_DIR"
+  local lockf=$MODELS_DIR/.run.lock rc=0
+  if [[ $NO_LOCK == 1 ]]; then
+    log "WARNING: --no-lock: running without the run lock; make sure no other run uses this volume"
+    return 0
+  fi
   if ! command -v flock >/dev/null; then
     log "WARNING: flock not found; concurrent runs are not prevented"
     return 0
   fi
-  exec 9>"$MODELS_DIR/.run.lock"
-  flock -n 9 || die "another download-models run is already using $VOLUME_ROOT (lock $MODELS_DIR/.run.lock). Wait for it to finish."
+  [[ -L $lockf ]] && die "$lockf is a symlink; refusing to open it. Remove it and retry."
+  exec 9>>"$lockf" || die "cannot open lock file $lockf (filesystem problem?). Re-run with --no-lock for a supervised single run."
+  flock -n -E 200 9 || rc=$?
+  case $rc in
+    0) ;;
+    200) die "another download-models run is already using $VOLUME_ROOT (lock $lockf). Wait for it to finish." ;;
+    *) die "could not take the run lock $lockf (flock exit $rc); the volume filesystem may not support locks. For a supervised single run, re-run with --no-lock." ;;
+  esac
 }
 
 # ---------------------------------------------------------------- actions

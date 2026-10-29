@@ -249,6 +249,33 @@ wait "$LOCKER" 2>/dev/null
 run
 check "run succeeds once the lock is released" test "$RC" = 0
 
+# planted symlink as lock file: refused, target untouched (not truncated)
+new_vol
+mkdir -p "$VOL/models"
+echo precious >"$T/target.txt"
+ln -s "$T/target.txt" "$VOL/models/.run.lock"
+run
+check "symlinked .run.lock is refused" bash -c "test $RC -ne 0 && grep -q 'symlink' '$T/out'"
+check "symlink target left untouched" test "$(cat "$T/target.txt")" = precious
+
+# flock failing for another reason (e.g. unsupported filesystem): distinct message, --no-lock works
+mkdir -p "$T/fakebin"
+printf '#!/bin/sh\nexit 3\n' >"$T/fakebin/flock"
+chmod +x "$T/fakebin/flock"
+new_vol
+PATH="$T/fakebin:$PATH" run
+check "flock failure is not reported as 'another run'" \
+  bash -c "test $RC -ne 0 && grep -q 'may not support locks' '$T/out' && ! grep -q 'another download-models run' '$T/out'"
+PATH="$T/fakebin:$PATH" run --no-lock
+check "--no-lock proceeds with a warning" bash -c "test $RC = 0 && grep -q 'no-lock' '$T/out' && cmp -s '$T/srv/a/one.bin' '$VOL/models/a/one.bin'"
+new_vol
+NO_LOCK=1 PATH="$T/fakebin:$PATH" run
+check "NO_LOCK=1 env also skips the lock" test "$RC" = 0
+
+# --help works even with an invalid JOBS
+JOBS=0 "$SCRIPT" --help >"$T/out" 2>&1
+check "--help works with invalid JOBS" bash -c "test $? = 0 && grep -q Usage '$T/out'"
+
 # mountpoint guard (no SKIP_MOUNT_CHECK)
 new_vol
 HF_TOKEN=$TOKEN LOCK_FILE=$LOCK "$SCRIPT" --volume-root "$VOL" >"$T/out" 2>&1
