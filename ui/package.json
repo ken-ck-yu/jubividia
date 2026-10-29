@@ -1,0 +1,20 @@
+{
+  "name": "jubividia-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "jubividia front end: one Cloudflare Worker (static page + API in front of RunPod and R2)",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "test": "vitest run",
+    "check": "node scripts/check-static.mjs"
+  },
+  "dependencies": {
+    "jose": "6.2.14"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.23.0",
+    "vitest": "4.1.12",
+    "wrangler": "4.155.0"
+  }
+}
