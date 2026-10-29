@@ -27,7 +27,7 @@ Input: `mode` (`t2v`/`i2v`/`v2v`), `prompt`, optional `negative`, `input_key` (a
 
 Output: `{v, key, thumb_key, meta_key, duration_s, gen_time_s, seed, width, height, num_frames, fps, cold}`. R2 keys are `outputs/<YYYY-MM-DD>/<YYYYMMDDTHHMMSS>-<job_id>.mp4|.jpg|.json`; the `.json` sidecar holds the prompt and parameters. The timestamp is taken when the job starts, so a retried job gets new keys: the UI must not assume a retry overwrites the earlier result.
 
-Failure: `{error, error_code}` with codes `bad_input`, `config_error` (missing R2 env), `input_fetch`, `workflow_mismatch`, `model_missing`, `oom`, `timeout`, `comfy_unavailable` (ComfyUI unreachable or its process is dead), `comfy_bad_response` (non-JSON reply or no prompt_id), `comfy_error`, `output_missing`, `upload_failed` (after 3 tries). Whether RunPod's `/status` exposes `error_code` for a FAILED job is unverified.
+Failure: `{error, error_code}`; the text is prefixed with the code, e.g. `[upload_failed] ...`, as a fallback in case RunPod drops `error_code`. Codes: `bad_input`, `config_error` (missing R2 env), `input_fetch`, `workflow_mismatch`, `model_missing`, `oom`, `timeout`, `comfy_unavailable` (ComfyUI unreachable or its process is dead), `comfy_bad_response` (non-JSON reply or no prompt_id), `comfy_error`, `output_missing`, `upload_failed` (after 3 tries). Whether RunPod's `/status` exposes `error_code` for a FAILED job is unverified.
 
 Workflow templates (`/runpod-volume/workflows/<mode>.json`) must be ComfyUI **API format** (not the UI export). They are filled by node `_meta.title`; the first listed input name present on the node is set:
 
@@ -42,7 +42,7 @@ Workflow templates (`/runpod-volume/workflows/<mode>.json`) must be ComfyUI **AP
 
 The output is the single video the graph saves: use exactly one `SaveVideo`, or title the saving node `OUTPUT` (it then wins). Two or more videos without an `OUTPUT` node fail with `workflow_mismatch`; temp/preview files are ignored.
 
-Uploads use boto3 with `request_checksum_calculation` / `response_checksum_validation` set to `when_required` for R2 compatibility, 10 s connect / 60 s read timeouts and 3 tries. **The first real upload to R2 is a gating check**: it has not been exercised against real R2 yet.
+Uploads use boto3 with `request_checksum_calculation` / `response_checksum_validation` set to `when_required` for R2 compatibility, 5 s connect / 30 s read timeouts, boto retries off and the handler's own 3 bounded tries (each try is capped at 45 s by a thread join and all uploads must finish by 885 s after job start, so a stalled R2 can never push the job past the 900 s platform limit; generation gets 780 s by default). A failed job is not retried by the worker: fail and resubmit. **The first real upload to R2 is a gating check**: it has not been exercised against real R2 yet.
 
 `worker/constraints.txt` is a `pip freeze` of the built image, used as a pip constraints file so rebuilds resolve to the same versions (no torch-family changes).
 
