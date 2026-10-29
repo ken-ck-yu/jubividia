@@ -1,0 +1,688 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "Load Transformer"
+    }
+  },
+  "2": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ltx-2.5-video-vae-bf16.safetensors"
+    },
+    "_meta": {
+      "title": "Load Video VAE"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ltx-2.5-audio-vae-bf16.safetensors"
+    },
+    "_meta": {
+      "title": "Load Audio VAE"
+    }
+  },
+  "4": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "Load Text Encoder"
+    }
+  },
+  "5": {
+    "class_type": "LatentUpscaleModelLoader",
+    "inputs": {
+      "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    },
+    "_meta": {
+      "title": "Load Spatial Upscaler"
+    }
+  },
+  "6": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 1280
+    },
+    "_meta": {
+      "title": "WIDTH"
+    }
+  },
+  "7": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 704
+    },
+    "_meta": {
+      "title": "HEIGHT"
+    }
+  },
+  "8": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 121
+    },
+    "_meta": {
+      "title": "FRAMES"
+    }
+  },
+  "9": {
+    "class_type": "PrimitiveFloat",
+    "inputs": {
+      "value": 24.0
+    },
+    "_meta": {
+      "title": "FPS"
+    }
+  },
+  "10": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 42
+    },
+    "_meta": {
+      "title": "SEED"
+    }
+  },
+  "11": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "PROMPT"
+    }
+  },
+  "12": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "pc game, console game, video game, cartoon, childish, ugly.",
+      "clip": [
+        "4",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "NEGATIVE"
+    }
+  },
+  "13": {
+    "class_type": "LTXVConditioning",
+    "inputs": {
+      "positive": [
+        "11",
+        0
+      ],
+      "negative": [
+        "12",
+        0
+      ],
+      "frame_rate": [
+        "9",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Conditioning"
+    }
+  },
+  "14": {
+    "class_type": "LoadVideo",
+    "inputs": {
+      "file": "example.mp4"
+    },
+    "_meta": {
+      "title": "INPUT"
+    }
+  },
+  "15": {
+    "class_type": "Video Slice",
+    "inputs": {
+      "video": [
+        "14",
+        0
+      ],
+      "start_time": -4.0,
+      "duration": 0.0,
+      "strict_duration": false
+    },
+    "_meta": {
+      "title": "Trim To Last Seconds"
+    }
+  },
+  "16": {
+    "class_type": "GetVideoComponents",
+    "inputs": {
+      "video": [
+        "15",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Decode Tail"
+    }
+  },
+  "17": {
+    "class_type": "ImageFromBatch",
+    "inputs": {
+      "image": [
+        "16",
+        0
+      ],
+      "batch_index": -25,
+      "length": 25
+    },
+    "_meta": {
+      "title": "Last K Frames"
+    }
+  },
+  "18": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": [
+        "17",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "width": [
+        "6",
+        0
+      ],
+      "height": [
+        "7",
+        0
+      ],
+      "crop": "center"
+    },
+    "_meta": {
+      "title": "Fit Frames To Size"
+    }
+  },
+  "19": {
+    "class_type": "ComfyMathExpression",
+    "inputs": {
+      "expression": "a/2",
+      "values.a": [
+        "6",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Half Width"
+    }
+  },
+  "20": {
+    "class_type": "ComfyMathExpression",
+    "inputs": {
+      "expression": "a/2",
+      "values.a": [
+        "7",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Half Height"
+    }
+  },
+  "21": {
+    "class_type": "EmptyLTXVLatentVideo",
+    "inputs": {
+      "width": [
+        "19",
+        1
+      ],
+      "height": [
+        "20",
+        1
+      ],
+      "length": [
+        "8",
+        0
+      ],
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Empty Video Latent"
+    }
+  },
+  "22": {
+    "class_type": "LTXVAddGuide",
+    "inputs": {
+      "positive": [
+        "13",
+        0
+      ],
+      "negative": [
+        "13",
+        1
+      ],
+      "vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "21",
+        0
+      ],
+      "image": [
+        "18",
+        0
+      ],
+      "frame_idx": 0,
+      "strength": 1.0
+    },
+    "_meta": {
+      "title": "Guide Stage 1"
+    }
+  },
+  "23": {
+    "class_type": "LTXVEmptyLatentAudio",
+    "inputs": {
+      "frames_number": [
+        "8",
+        0
+      ],
+      "frame_rate": [
+        "9",
+        0
+      ],
+      "batch_size": 1,
+      "audio_vae": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Empty Audio Latent"
+    }
+  },
+  "24": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": [
+        "22",
+        2
+      ],
+      "audio_latent": [
+        "23",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Join AV Stage 1"
+    }
+  },
+  "25": {
+    "class_type": "LTXVDualCFGGuider",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "22",
+        0
+      ],
+      "negative": [
+        "22",
+        1
+      ],
+      "video_cfg": 1.0,
+      "audio_cfg": 1.0
+    },
+    "_meta": {
+      "title": "Guider Stage 1"
+    }
+  },
+  "26": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": [
+        "10",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Noise Stage 1"
+    }
+  },
+  "27": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler_ancestral"
+    },
+    "_meta": {
+      "title": "Sampler Stage 1"
+    }
+  },
+  "28": {
+    "class_type": "ManualSigmas",
+    "inputs": {
+      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    },
+    "_meta": {
+      "title": "Sigmas Stage 1"
+    }
+  },
+  "29": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "26",
+        0
+      ],
+      "guider": [
+        "25",
+        0
+      ],
+      "sampler": [
+        "27",
+        0
+      ],
+      "sigmas": [
+        "28",
+        0
+      ],
+      "latent_image": [
+        "24",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Sample Stage 1"
+    }
+  },
+  "30": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": [
+        "29",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Split AV Stage 1"
+    }
+  },
+  "31": {
+    "class_type": "LTXVCropGuides",
+    "inputs": {
+      "positive": [
+        "22",
+        0
+      ],
+      "negative": [
+        "22",
+        1
+      ],
+      "latent": [
+        "30",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Crop Guides Stage 1"
+    }
+  },
+  "32": {
+    "class_type": "LTXVLatentUpsampler",
+    "inputs": {
+      "samples": [
+        "31",
+        2
+      ],
+      "upscale_model": [
+        "5",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Upscale Latent x2"
+    }
+  },
+  "33": {
+    "class_type": "LTXVAddGuide",
+    "inputs": {
+      "positive": [
+        "31",
+        0
+      ],
+      "negative": [
+        "31",
+        1
+      ],
+      "vae": [
+        "2",
+        0
+      ],
+      "latent": [
+        "32",
+        0
+      ],
+      "image": [
+        "18",
+        0
+      ],
+      "frame_idx": 0,
+      "strength": 1.0
+    },
+    "_meta": {
+      "title": "Guide Stage 2"
+    }
+  },
+  "34": {
+    "class_type": "LTXVConcatAVLatent",
+    "inputs": {
+      "video_latent": [
+        "33",
+        2
+      ],
+      "audio_latent": [
+        "30",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Join AV Stage 2"
+    }
+  },
+  "35": {
+    "class_type": "LTXVDualCFGGuider",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "33",
+        0
+      ],
+      "negative": [
+        "33",
+        1
+      ],
+      "video_cfg": 1.0,
+      "audio_cfg": 1.0
+    },
+    "_meta": {
+      "title": "Guider Stage 2"
+    }
+  },
+  "36": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": [
+        "10",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Noise Stage 2"
+    }
+  },
+  "37": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "sampler_name": "euler_ancestral"
+    },
+    "_meta": {
+      "title": "Sampler Stage 2"
+    }
+  },
+  "38": {
+    "class_type": "ManualSigmas",
+    "inputs": {
+      "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+    },
+    "_meta": {
+      "title": "Sigmas Stage 2"
+    }
+  },
+  "39": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": [
+        "36",
+        0
+      ],
+      "guider": [
+        "35",
+        0
+      ],
+      "sampler": [
+        "37",
+        0
+      ],
+      "sigmas": [
+        "38",
+        0
+      ],
+      "latent_image": [
+        "34",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Sample Stage 2"
+    }
+  },
+  "40": {
+    "class_type": "LTXVSeparateAVLatent",
+    "inputs": {
+      "av_latent": [
+        "39",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Split AV Stage 2"
+    }
+  },
+  "41": {
+    "class_type": "LTXVCropGuides",
+    "inputs": {
+      "positive": [
+        "33",
+        0
+      ],
+      "negative": [
+        "33",
+        1
+      ],
+      "latent": [
+        "40",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Crop Guides Final"
+    }
+  },
+  "42": {
+    "class_type": "VAEDecodeTiled",
+    "inputs": {
+      "samples": [
+        "41",
+        2
+      ],
+      "vae": [
+        "2",
+        0
+      ],
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 16
+    },
+    "_meta": {
+      "title": "Decode Video"
+    }
+  },
+  "43": {
+    "class_type": "LTXVAudioVAEDecode",
+    "inputs": {
+      "samples": [
+        "40",
+        1
+      ],
+      "audio_vae": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Decode Audio"
+    }
+  },
+  "44": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "images": [
+        "42",
+        0
+      ],
+      "fps": [
+        "9",
+        0
+      ],
+      "audio": [
+        "43",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Assemble Video"
+    }
+  },
+  "45": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": [
+        "44",
+        0
+      ],
+      "filename_prefix": "video/LTX_2.5_v2v_wf1",
+      "format": "mp4",
+      "format.codec": "h264"
+    },
+    "_meta": {
+      "title": "OUTPUT"
+    }
+  }
+}
