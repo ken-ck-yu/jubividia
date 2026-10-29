@@ -167,3 +167,80 @@ Read-only checks for the coordinator before each billable step (REST GET or MCP 
 8. Does Ken want the $0.99/hr RTX 6000 Ada pod fallback stated in the README next to "stop and ask if CPU stock is gone"?
 9. The example config pre-fills `IMAGE_TAG=sha-f637c09`, an image without `peak_vram_mb`/`EXEC_TIMEOUT_S`. Leave it empty in the example so nobody runs the gate on the old image by copy-paste?
 10. An overall spend guard for the gate (for example a total wall-clock cap, or a required `--yes-i-have-seen-the-quote` flag) does not exist; `smoke-job.sh` bills as soon as it runs. Is the per-job cap plus coordinator discipline enough?
+
+---
+
+# Re-check of the fix round (commits 2246825, 83c6636, aed20d4, a9408e7)
+
+Same rules as before: no RunPod or Cloudflare call, fake server and my own mock servers on 127.0.0.1 only, `config.env` never read. I checked behaviour myself with new harnesses (`brk5-7.sh`, `urlcheck2.sh`, `mock2.py` in the job scratch dir, not committed).
+
+## Re-check verdict: ACCEPT WITH FIXES (one small must-fix, rest optional)
+
+F1 to F4 and W1 are fixed and I could not break the fixes in the ways I tried. I found one remaining way for `smoke-job.sh` to hang (N1) and a few cosmetic or low items. N1 should be fixed before the gate because the gate is billable; the rest can wait.
+
+## Test runs
+
+| Command | Result |
+|---|---|
+| `make -f infra/runpod/infra.mk test-infra` (no shellcheck) | 330 passed, 0 failed |
+| same with shellcheck 0.11 on PATH (scratch venv) | 331 passed, 0 failed |
+| `make test` | 123 passed |
+| `make lint` | clean |
+| `shellcheck -x -e SC1091` on `apply.sh lib.sh smoke-job.sh tests/infra/run.sh download-models.sh validate-workflows.sh wf-in-container.sh tests/models/run.sh` | no output, exit 0 |
+
+## Fix by fix
+
+| Item | Result | Evidence |
+|---|---|---|
+| F1 `/status` failing | **fixed** | Mock servers returning 500, 401, HTML 200 and `{}` 200 forever: exit 3 after 5 polls (1-2 s), one cancel sent, no hang. A cancel that also returns 500: same, exit 3 (cancel is best effort and cannot abort the script). IN_PROGRESS then 500 with a 1 s in-progress cap: the cap still fires while polls fail. Unhealthy worker with `/status` failing: stops on the unhealthy check. Throttled queue: stops after the queue limit. `--max-spend abc` rejected. |
+| F2 canary | **fixed** | `[input_fetch] input not found` passes with or without `error_code` (a missing field becomes a note, gate continues). Any other text (`could not fetch input`, unknown prefix, other `error_code`) is `stop` with exit 3 before any model job; a non-FAILED canary goes to the summary (exit 1) before any model job. |
+| F3 shellcheck | **fixed** | Zero findings including `tests/infra/run.sh`; `infra.mk` lint covers it; the suite's shellcheck test passes when shellcheck is present. |
+| F4 loopback guard | **fixed** | Anchored regex `^http://127\.0\.0\.1:[0-9]{1,5}(/...)?(\?...)?$`. Refused: `@` userinfo in all earlier forms, `#`, backslash, `@` in path or query, newline-embedded second URL, trailing newline, space, 6-digit port, empty, uppercase scheme, `https`, hex/decimal/IPv6-mapped loopback, `;`. Allowed: only real loopback URLs (including harmless paths like `//evil.invalid/` that stay on 127.0.0.1). No redirect following (no `-L`). Test mode now adds `--noproxy '*'` to every curl, so a proxy variable cannot take loopback traffic. `RUNPOD_TEST_MODE=0` still disables the guard by design. |
+| `aws`/`ffprobe` on this machine (real `/usr/local/bin/aws`) | **safe in test mode** | In test mode `r2_check` skips unless `SMOKE_ALLOW_STUB_AWS=1`; the suite sets that only with a stub `aws`/`ffprobe` first in PATH. All other suite smoke runs use `--no-r2-check`. Residual: `SMOKE_ALLOW_STUB_AWS=1` plus test mode with no stub would run the real aws against R2 (explicit opt-in). In normal mode `r2_check` runs the real aws against R2 by design. |
+| W1 VRAM clamp | **fixed** | Handler clamps `VRAM_SAMPLE_S` to >= 0.2 (parametrised test: 0, -3, 0.05, 0.5, 2); `tune_json` rejects < 0.2 (0, 0.1 die; 0.2, 1 pass; `abc` dies). New tests: `EXEC_TIMEOUT_S=1200` override in a subprocess, sampler stopped and thread dead when generation raises. Thread semantics unchanged (daemon, event stop, join 10 s): no leak, at most one fork per 0.2 s. `VramSampler(interval=x)` called directly is not clamped, only the env path. |
+| Q6 requestUrls | **done** | `smoke-job.sh` GETs `/serverless/<id>` and uses `requestUrls.run` minus `/run` when it matches `^https?://[^ @#]+/run$`, else `RUNPOD_RUN_BASE`. Every request still passes the test-mode guard. In real mode the key goes to whatever host that field names (trusted RunPod response); consider pinning to `*.runpod.ai` (N3). |
+| Q7 volume | **done** | Adopting a volume named `jubividia-ltx-us-wa1`, 80 GB, STANDARD, US-WA-1: **0 writes** (also on the second run with the id in config). Id in config pointing at a US-CA-2 HIGH_PERFORMANCE volume: refused, 0 writes. Config wants 100 GB: refuses without `--yes` (also under `--dry-run`, which writes nothing), one PATCH with `--yes`; 40 GB: refuses to shrink. |
+| Q9 empty IMAGE_TAG | **done** | `endpoint` and `preflight` die on an empty tag (endpoint reports a missing volume id first if that is also unset), `smoke-job.sh` dies on empty and on `latest`; 0 writes. |
+| Q10 `--max-spend` (default 1.50, 1.75/hr) | **works, with limits** | `--max-spend 0.01` on a stuck job: stopped at $0.0101 with a cancel sent. Counting is wall time while the job is IN_PROGRESS or `/health` shows idle+running+initializing workers, plus the wait-for-scale-to-zero period. A stuck or unhealthy worker cannot bypass it when `/health` works. Not conservative: the 60 s idle tail after each job, the last poll interval of each job and time before the first poll are not counted (cents). It counts nothing when neither `/status` nor `/health` can be read (see N1); the 5-poll limit covers the `/status` case. $1.50 is close to the design's expected gate cost ($1-2) and may stop a legitimate slow run; it is a flag. |
+| L1 | **fixed** | The kill hook is only honoured when `RUNPOD_TEST_MODE=1`; verified a real-mode run with the variable set ignores it. |
+| L2 | **fixed** | `.gitignore` has `config.env.tmp.*`. |
+| L5 | **mostly fixed** | `count_ids` makes `preflight` abort on a second page. In `status` the call sits inside a `say` command substitution and the pod count is still `| grep -c . || true`, so a paged list would print an empty count after the stderr message instead of aborting (N5, unrealistic at limit 1000). |
+| L7 | **fixed** | handler message and the smoke timeout line (reads `RUNPOD_EXEC_TIMEOUT_MS`). |
+| L8 | **fixed** | `pod-up` prints a note right after creating the temporary secret saying to run `pod-down` if pod creation fails. |
+| R3 | **fixed** | `RUNPOD_QUEUE_DELAY_S` 0.5 and 4 accepted, 0.2 and `abc` rejected with a clear message. |
+
+## Regression checks
+
+- Full `pod-up`, `pod-logs`, `pod-down` flow with sentinel HF token, API key and R2 values and a decoy pod `jubividia-models-tmp-2`: no sentinel in output or curl argv; exactly two deletes, `DELETE /v2/pods/<exact-named pod>` and `DELETE /v2/account/secrets/<hf_token_tmp id>`; the decoy pod and both R2 secrets remain.
+- `git grep` of delete call sites: `api_delete pod|secret_hf|endpoint` and the single `api DELETE` in `api_delete`; no path for volumes or the R2 secrets.
+- `--dry-run` on all 8 subcommands: 0 writes.
+- No secrets in tree (grep for `rpa_`, `hf_...`, `AKIA` empty); the four new commits add no keys; the earlier history check stands. Worktree was clean before this section.
+- Handler: 123 tests pass; deadline arithmetic unchanged (780 s generation, 885 s uploads).
+
+## Remaining findings
+
+- **N1 (fix before the gate):** `smoke-job.sh` still hangs if `/status` answers `IN_QUEUE` forever while `/health` fails (HTTP 500). The queue-stop check needs `/health`, the spend counter sees no billing, and failed health calls are not counted. Reproduced: killed by my 40 s timeout after 172 polls, no stop, no cancel. The same happens if both `/status` and `/health` fail and `SMOKE_POLL_FAIL_LIMIT` is raised. Fix: count consecutive `/health` failures, or add a per-job wall-clock cap (execution timeout plus queue limit), and stop with exit 3 and a cancel.
+- N2 (cosmetic): the stop message "last HTTP N" shows the cancel call's status (for example 200) instead of the failing poll's status, because the cancel runs before the message is built.
+- N3 (low): `requestUrls.run` host is not restricted to RunPod.
+- N4 (low): the spend estimate undercounts the idle tail (cents).
+- N5: `status` pagination handling (L5 above).
+
+## What cannot be verified without real calls (unchanged)
+
+Secret substitution at boot; the live GET shape of an endpoint (`disk`, `image`, `env`, `gpu.minCudaVersion`, and `requestUrls.run` as the new code expects); runtime `/health` and `/status` field names, the `cancel` route and `error_code` visibility; live GPU pool and type ids; the `cpu3c` id and CPU/GPU stock; `mountpoint` and `flock` on the mount; balance; whether pod DELETE is synchronous; real FlashBoot and scaling behaviour.
+
+## Read-only checks for the coordinator before each billable step
+
+- **Volume:** `GET /network-volumes` lists `jubividia-ltx-us-wa1` (80 GB, STANDARD, US-WA-1) exactly once; `apply.sh --dry-run volume` says "adopting existing volume" and makes no create; with a config id, the dc/type assertion confirms it.
+- **Secrets:** list the two names; confirm balance and payment in the console; confirm the R2 token is scoped to `jubividia-ltx-eu`, Object Read & Write.
+- **Temp pod:** re-read CPU stock and the `cpu3c` id at US-WA-1; `RUNPOD_POD_IMAGE` and a 40-hex `GIT_REF` set; no pod named `jubividia-models-tmp`; right after `pod-up` read `GET /pods/{id}` once to confirm `HF_TOKEN` is the secret reference; afterwards `GET /pods` is empty and `hf_token_tmp` is gone.
+- **Endpoint:** `IMAGE_TAG` is the build of the merge containing `e8e909e` and `2246825` (set explicitly; empty or `latest` is refused); anonymous GHCR manifest (preflight); RTX 6000 Ada stock at US-WA-1; catalog pool and type ids; review the `--dry-run endpoint` body; right after create `GET /serverless/{id}` and compare `timeout`, `flashboot`, `gpu`, `mounts`, `requestUrls`; use `--max-workers 1` for the gate.
+- **Gate:** N1 fixed first; `/health` shows 0 workers; decide `--max-spend` with Ken (default $1.50); keep the console open on Workers; after any exit 3 read `/health` and cancel the job by hand if the script could not.
+
+## Numbered questions (re-check)
+
+1. N1: may the engineer add a consecutive `/health`-failure limit or a per-job wall-clock cap to `smoke-job.sh` before the gate?
+2. Does Ken accept `--max-spend` 1.50 as the default, or should it be set explicitly per run (for example 3.00 for the full gate including the cold default job)?
+3. Should the run URL taken from `requestUrls` be pinned to a RunPod host (N3)?
+4. Should `status` abort on a second page like the other commands (N5)?
+5. Should the stop message report the failing poll's HTTP status rather than the cancel's (N2)?
