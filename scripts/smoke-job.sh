@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# Real-GPU gate runner for the jubividia endpoint (docs/decisions/endpoint.md, "Real-GPU gating plan").
+# BILLABLE: every job runs on a RunPod RTX 6000 Ada ($1.75/hr). Run only after Ken has seen the quote.
+#
+#   scripts/smoke-job.sh [--no-r2-check] [--skip-final-cold] [--csv PATH]
+#
+# Order (cheapest checks first):
+#   1 canary     missing-input i2v job. Needs good R2 secrets, never loads models.
+#   2 cold-tiny  256x256x25 t2v on a cold worker
+#   3 warm-tiny  same job again
+#   4 warm-def   1280x704x121 @24 fps
+#   5 warm-def2  same again: must be within 10% of #4 (no encoder eviction / reload)
+#   6 wait for scale to zero, then 7 cold-def: the user's real "first job after idle" path
+# Uses /run + /status + /health only (never /runsync: it sits behind a ~100 s edge timeout).
+# Cold start = delayTime + executionTime of a job, minus its gen_time_s.
+# Stops (exit 3) and asks Ken when: a worker goes Unhealthy; a job stays IN_PROGRESS past 15 min;
+# a job waits in the queue with no usable worker (throttled) past 5 min; cold start > 600 s;
+# cold-tiny start + warm default gen_time > 700 s; warm gen_time > 300 s.
+# Exit codes: 0 gate passed, 1 gate failed, 2 usage/config, 3 stop-and-ask.
+# Output never contains the API key or R2 secrets (lib.sh redact()).
+set -euo pipefail
+TOOL_NAME=smoke-job
+# shellcheck source=../infra/runpod/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../infra/runpod/lib.sh"
+
+R2_CHECK=1
+FINAL_COLD=1
+CSV=${SMOKE_CSV:-$ROOT/docs/validation/endpoint-timings.csv}
+POLL_S=${SMOKE_POLL_S:-5}
+MAX_INPROGRESS_S=${SMOKE_MAX_INPROGRESS_S:-900}
+QUEUE_STOP_S=${SMOKE_QUEUE_STOP_S:-300}
+IDLE_WAIT_S=${SMOKE_IDLE_WAIT_S:-600}
+COLD_FLAG_S=180
+COLD_HARD_S=600
+SUM_STOP_S=700
+WARM_STOP_S=300
+VRAM_REPORT_MB=47104   # 46 GiB: report-only, never a pass/fail
+
+while (($#)); do
+  case $1 in
+    --no-r2-check) R2_CHECK=0 ;;
+    --skip-final-cold) FINAL_COLD=0 ;;
+    --csv) (($# >= 2)) || die "--csv needs a path"; CSV=$2; shift ;;
+    -h | --help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown argument $1" ;;
+  esac
+  shift
+done
+
+read_config
+need_cfg RUNPOD_API_KEY RUNPOD_ENDPOINT_ID
+EP=$(cfg RUNPOD_ENDPOINT_ID)
+FAILS=()
+NOTES=()
+
+stop() { # stop REASON  -> exit 3
+  say ""
+  say "STOP AND ASK KEN: $1"
+  say "Do not work around it and do not retry blindly. Check /health and the worker logs, then report the evidence."
+  exit 3
+}
+
+health() { # sets H_UNHEALTHY H_THROTTLED H_IDLE H_RUNNING H_INIT
+  http GET "$RUN_BASE/$EP/health"
+  H_UNHEALTHY=0 H_THROTTLED=0 H_IDLE=0 H_RUNNING=0 H_INIT=0
+  api_ok || return 1
+  H_UNHEALTHY=$(json_get workers.unhealthy); H_UNHEALTHY=${H_UNHEALTHY:-0}
+  H_THROTTLED=$(json_get workers.throttled); H_THROTTLED=${H_THROTTLED:-0}
+  H_IDLE=$(json_get workers.idle); H_IDLE=${H_IDLE:-0}
+  H_RUNNING=$(json_get workers.running); H_RUNNING=${H_RUNNING:-0}
+  H_INIT=$(json_get workers.initializing); H_INIT=${H_INIT:-0}
+}
+
+awkf() { awk "$@"; }
+
+# run_job LABEL INPUT_JSON -> J_STATUS J_ID J_DELAY J_EXEC J_GEN J_COLD J_KEY J_THUMB J_META J_VRAM J_START
+# and J_RAW_KEYS (names of the /status fields), J_ERR (error text)
+run_job() {
+  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting
+  say ""
+  say "--- $label: submitting"
+  if health; then say "    health: idle=$H_IDLE running=$H_RUNNING initializing=$H_INIT throttled=$H_THROTTLED unhealthy=$H_UNHEALTHY"
+  else say "    (health unavailable: HTTP $API_STATUS)"; fi
+  http POST "$RUN_BASE/$EP/run" "{\"input\":$input}"
+  api_ok || die "$label: POST /run failed: HTTP $API_STATUS ${API_BODY:0:300}"
+  J_ID=$(json_get id)
+  [[ -n $J_ID ]] || die "$label: /run returned no job id"
+  say "    job $J_ID"
+  t0=$SECONDS
+  while :; do
+    sleep "$POLL_S"
+    http GET "$RUN_BASE/$EP/status/$J_ID"
+    api_ok || { warn "status HTTP $API_STATUS"; continue; }
+    st=$(json_get status)
+    now=$((SECONDS - t0))
+    if [[ $st != "$last" ]]; then say "    [${now}s] $st"; last=$st; fi
+    case $st in
+      COMPLETED | FAILED | CANCELLED | TIMED_OUT) break ;;
+      IN_PROGRESS) ((in_progress_since >= 0)) || in_progress_since=$now ;;
+    esac
+    if health; then
+      ((H_UNHEALTHY == 0)) || stop "$label: a worker is Unhealthy (unhealthy=$H_UNHEALTHY). Job $J_ID may still be billing; cancel it only after Ken agrees."
+      waiting=$((H_IDLE + H_RUNNING + H_INIT))
+      if [[ $st == IN_QUEUE ]] && ((now > QUEUE_STOP_S)) && ((H_THROTTLED > 0 || waiting == 0)); then
+        stop "$label: IN_QUEUE for ${now}s with throttled=$H_THROTTLED and no usable worker: the RTX 6000 Ada cannot be acquired (stock). Ask before widening the pool or moving DC."
+      fi
+    fi
+    if ((in_progress_since >= 0 && now - in_progress_since > MAX_INPROGRESS_S)); then
+      http POST "$RUN_BASE/$EP/cancel/$J_ID" "{}" || true
+      stop "$label: job $J_ID stayed IN_PROGRESS for more than ${MAX_INPROGRESS_S}s; a cancel was sent to stop the spend."
+    fi
+  done
+  J_STATUS=$st
+  J_DELAY=$(json_get delayTime); J_EXEC=$(json_get executionTime)
+  J_GEN=$(json_get output.gen_time_s); J_COLD=$(json_get output.cold)
+  J_KEY=$(json_get output.key); J_THUMB=$(json_get output.thumb_key); J_META=$(json_get output.meta_key)
+  J_VRAM=$(json_get output.peak_vram_mb)
+  J_ERR=$(json_get error); [[ -n $J_ERR ]] || J_ERR=$(json_get output.error)
+  J_ERRCODE=$(json_get error_code); [[ -n $J_ERRCODE ]] || J_ERRCODE=$(json_get output.error_code)
+  J_FIELDS=$(printf '%s' "$API_BODY" | "${PYTHON:-python3}" -I -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin))))')
+  J_START=
+  if [[ $J_STATUS == COMPLETED && -n $J_DELAY && -n $J_EXEC && -n $J_GEN ]]; then
+    J_START=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" -v g="$J_GEN" 'BEGIN{printf "%.1f",(d+e)/1000-g}')
+  fi
+  J_AUDIO=
+  say "    status=$J_STATUS delayTime=${J_DELAY:-?}ms executionTime=${J_EXEC:-?}ms gen_time_s=${J_GEN:-?} cold=${J_COLD:-?} peak_vram_mb=${J_VRAM:-null}"
+  if [[ $J_STATUS == COMPLETED ]]; then
+    say "    cold start (delayTime + executionTime - gen_time) = ${J_START:-?} s"
+    say "    keys: $J_KEY $J_THUMB $J_META"
+    if ((R2_CHECK)); then r2_check "$label"; fi
+  else
+    say "    /status fields: $J_FIELDS"
+    say "    error: ${J_ERR:-?}"
+    say "    error_code field: ${J_ERRCODE:-ABSENT (only the [code] prefix in the error text, if any)}"
+  fi
+  record_csv "$label"
+}
+
+record_csv() {
+  mkdir -p "$(dirname "$CSV")"
+  [[ -f $CSV ]] || echo "utc,label,job_id,status,cold_flag,delay_ms,exec_ms,gen_time_s,cold_start_s,peak_vram_mb,key,audio" >"$CSV"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$J_ID" "$J_STATUS" \
+    "${J_COLD:-}" "${J_DELAY:-}" "${J_EXEC:-}" "${J_GEN:-}" "${J_START:-}" "${J_VRAM:-}" "${J_KEY:-}" "${J_AUDIO:-}" >>"$CSV"
+}
+
+# r2_check LABEL: head the three objects, download the mp4, ffprobe for an audio stream.
+r2_check() {
+  need_cfg R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET
+  if ! command -v aws >/dev/null; then J_AUDIO=unchecked; NOTES+=("$1: R2 check skipped (aws CLI missing)"); say "    R2 check SKIPPED: aws CLI not installed"; return 0; fi
+  local k tmp ctype ep=https://${CFG[R2_ACCOUNT_ID]}.r2.cloudflarestorage.com
+  tmp=$(mktemp -d)
+  for k in "$J_KEY" "$J_THUMB" "$J_META"; do
+    ctype=$(AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
+      aws --endpoint-url "$ep" s3api head-object --bucket "${CFG[R2_BUCKET]}" --key "$k" --query ContentType --output text 2>/dev/null) \
+      || { FAILS+=("$1: R2 object missing: $k"); say "    R2 MISSING: $k"; continue; }
+    say "    R2 ok: $k ($ctype)"
+  done
+  if AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
+    aws --endpoint-url "$ep" s3 cp "s3://${CFG[R2_BUCKET]}/$J_KEY" "$tmp/out.mp4" >/dev/null 2>&1; then
+    if command -v ffprobe >/dev/null; then
+      if ffprobe -v error -show_entries stream=codec_type,duration -of json "$tmp/out.mp4" 2>/dev/null | grep -q '"codec_type": *"audio"'; then
+        J_AUDIO=yes; say "    audio stream: present"
+      else
+        J_AUDIO=NO; FAILS+=("$1: no audio stream in the mp4"); say "    audio stream: MISSING"
+      fi
+    else J_AUDIO=unchecked; NOTES+=("$1: ffprobe missing, audio unchecked"); say "    audio check SKIPPED: ffprobe not installed"; fi
+  else FAILS+=("$1: could not download the mp4 from R2"); say "    R2 download failed"; fi
+  rm -rf "$tmp"
+}
+
+num_gt() { awkf -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
+
+check_cold() { # LABEL: flag > 180 s, stop > 600 s
+  [[ -n $J_START ]] || return 0
+  if num_gt "$J_START" "$COLD_HARD_S"; then stop "$1: cold start ${J_START}s exceeds the ${COLD_HARD_S}s hard limit."; fi
+  if num_gt "$J_START" "$COLD_FLAG_S"; then NOTES+=("$1: cold start ${J_START}s > ${COLD_FLAG_S}s (flag; propose mitigations, change nothing)"); fi
+}
+
+require_completed() { # LABEL
+  [[ $J_STATUS == COMPLETED ]] || {
+    FAILS+=("$1: job ended $J_STATUS (${J_ERR:-no error text})")
+    [[ $J_ERR == *oom* || $J_ERRCODE == oom ]] && FAILS+=("$1: OOM")
+    summary
+  }
+}
+
+summary() {
+  local f n
+  say ""
+  say "================ GATE SUMMARY ================"
+  say "csv: $CSV"
+  say "peak VRAM is report-only (nvidia-smi includes the allocator reserve; 46 GiB = ${VRAM_REPORT_MB} MiB): cold-tiny=${V_COLD_TINY:-n/a} warm-def=${V_WARM_DEF:-n/a} warm-def2=${V_WARM_DEF2:-n/a} cold-def=${V_COLD_DEF:-n/a} MiB"
+  say "offload: NOT detectable from job data; grep the worker logs for offload/lowvram messages and report them."
+  for n in "${NOTES[@]-}"; do [[ -n $n ]] && say "note: $n"; done
+  if ((${#FAILS[@]})); then
+    for f in "${FAILS[@]}"; do say "FAIL: $f"; done
+    say "GATE: FAIL"
+    exit 1
+  fi
+  say "GATE: PASS (no OOM, second warm default job within 10% of the first)"
+  exit 0
+}
+
+# ---------------------------------------------------------------- the gate
+TINY='{"mode":"t2v","prompt":"a red ball rolls across a wooden table, soft ambient sound","width":256,"height":256,"num_frames":25,"fps":24,"seed":1234}'
+DEF='{"mode":"t2v","prompt":"a red ball rolls across a wooden table in a sunlit room, soft ambient sound","width":1280,"height":704,"num_frames":121,"fps":24,"seed":1234}'
+CANARY='{"mode":"i2v","prompt":"smoke canary","input_key":"inputs/__smoke_missing__.png","width":256,"height":256,"num_frames":25}'
+
+say "gate against endpoint $EP ($RUN_BASE). Billable: RTX 6000 Ada \$1.75/hr."
+
+# 1 canary
+run_job canary "$CANARY"
+if [[ $J_STATUS != FAILED ]]; then
+  FAILS+=("canary: expected FAILED, got $J_STATUS"); summary
+fi
+if [[ $J_ERR == *"input not found"* ]]; then
+  say "    canary OK: R2 secrets resolved and R2 read works (input_fetch / input not found)"
+else
+  stop "canary: unexpected error '${J_ERR:-?}'. 'could not fetch input' or config_error means the R2 secrets did not resolve or lack read access. Fix before any model load."
+fi
+if [[ -z $J_ERRCODE ]]; then
+  FAILS+=("canary: /status exposes no error_code field (only the [code] prefix); contract assumption broken")
+fi
+
+# 2 cold tiny
+run_job cold-tiny "$TINY"; require_completed cold-tiny
+V_COLD_TINY=$J_VRAM
+COLD_TINY_START=$J_START
+COLD_TINY_TOTAL=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" 'BEGIN{printf "%.1f",(d+e)/1000}')
+check_cold cold-tiny
+[[ $J_COLD == true ]] || NOTES+=("cold-tiny: cold flag was '$J_COLD' (judge cold by delayTime, not by the flag)")
+
+# 3 warm tiny
+run_job warm-tiny "$TINY"; require_completed warm-tiny
+
+# 4 warm default
+run_job warm-def "$DEF"; require_completed warm-def
+V_WARM_DEF=$J_VRAM
+GEN1=$J_GEN
+if num_gt "$GEN1" "$WARM_STOP_S"; then stop "warm-def: gen_time_s ${GEN1}s exceeds ${WARM_STOP_S}s."; fi
+if num_gt "$GEN1" 180; then NOTES+=("warm-def: gen_time_s ${GEN1}s > 180 s (flag: SPEC 7 cost example assumes ~3 min per clip)"); fi
+if num_gt "$(awkf -v a="$COLD_TINY_TOTAL" -v b="$GEN1" 'BEGIN{print a+b}')" "$SUM_STOP_S"; then
+  stop "cold-tiny delay+exec (${COLD_TINY_TOTAL}s) + warm default gen_time (${GEN1}s) exceeds ${SUM_STOP_S}s: a first-after-idle default clip would not fit the 780 s job budget."
+fi
+
+# 5 second warm default: pass test is within 10%
+run_job warm-def2 "$DEF"; require_completed warm-def2
+V_WARM_DEF2=$J_VRAM
+if awkf -v a="$GEN1" -v b="$J_GEN" 'BEGIN{d=(b>a)?b-a:a-b; exit !(d<=0.10*a)}'; then
+  say "    second warm default job gen_time ${J_GEN}s is within 10% of the first (${GEN1}s)"
+else
+  FAILS+=("warm-def2: gen_time_s ${J_GEN}s differs from the first warm default job (${GEN1}s) by more than 10% (reload / eviction suspected)")
+fi
+
+# 6/7 final cold default clip
+if ((FINAL_COLD)); then
+  say ""
+  say "--- waiting for the worker to scale to zero (idle timeout 60 s), up to ${IDLE_WAIT_S}s"
+  w0=$SECONDS
+  while :; do
+    if health && ((H_IDLE + H_RUNNING + H_INIT == 0)); then break; fi
+    ((SECONDS - w0 < IDLE_WAIT_S)) || stop "worker did not scale to zero within ${IDLE_WAIT_S}s: idle timeout may not be 60 s; check the endpoint (it is billing)."
+    sleep "$POLL_S"
+  done
+  run_job cold-def "$DEF"; require_completed cold-def
+  V_COLD_DEF=$J_VRAM
+  check_cold cold-def
+  [[ $J_COLD == true ]] || NOTES+=("cold-def: cold flag was '$J_COLD' (FlashBoot restore or surviving process?); judge by delayTime")
+  TOTAL=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" 'BEGIN{printf "%.1f",(d+e)/1000}')
+  say "    user path (cold + default clip): ${TOTAL}s of the 780 s generation budget / 900 s execution timeout"
+  if num_gt "$TOTAL" 780; then FAILS+=("cold-def: delay+exec ${TOTAL}s exceeds the 780 s job budget"); fi
+fi
+summary
