@@ -15,17 +15,21 @@ RUN set -eux; \
     test -x /opt/venv/bin/python; command -v ffmpeg; command -v uv; \
     /opt/venv/bin/python -c "import boto3, requests, runpod, triton, torch; print('base ok, torch', torch.__version__)"
 
-# Custom node + requirements, with torch family frozen to the base's versions.
+# Custom node + requirements. constraints.txt is `pip freeze` of the image as
+# built on 2026-10-29 (base + LTXVideo requirements): rebuilds resolve to the
+# same versions, and the torch family cannot change. Regenerate deliberately
+# with: docker run --rm --entrypoint /opt/venv/bin/pip <image> freeze > worker/constraints.txt
+COPY constraints.txt /tmp/constraints-full.txt
 RUN set -eux; \
     git clone https://github.com/Lightricks/ComfyUI-LTXVideo /comfyui/custom_nodes/ComfyUI-LTXVideo; \
     git -C /comfyui/custom_nodes/ComfyUI-LTXVideo checkout "${LTXV_REF}"; \
     rm -rf /comfyui/custom_nodes/ComfyUI-LTXVideo/.git; \
     /opt/venv/bin/pip list --format=freeze | grep -iE '^(torch|torchvision|torchaudio|triton)==' > /tmp/constraints.txt; \
     cat /tmp/constraints.txt; \
-    uv pip install --python /opt/venv/bin/python -c /tmp/constraints.txt \
+    uv pip install --python /opt/venv/bin/python -c /tmp/constraints.txt -c /tmp/constraints-full.txt \
         -r /comfyui/custom_nodes/ComfyUI-LTXVideo/requirements.txt; \
     /opt/venv/bin/pip list --format=freeze | grep -iE '^(torch|torchvision|torchaudio|triton)==' | diff - /tmp/constraints.txt; \
-    rm /tmp/constraints.txt
+    rm /tmp/constraints.txt /tmp/constraints-full.txt
 
 COPY extra_model_paths.yaml /comfyui/extra_model_paths.yaml
 COPY handler.py /handler.py
