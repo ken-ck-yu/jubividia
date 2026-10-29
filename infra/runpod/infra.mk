@@ -10,8 +10,9 @@ lint-infra:
 	bash -n infra/runpod/apply.sh
 	bash -n infra/runpod/lib.sh
 	bash -n scripts/smoke-job.sh
+	bash -n tests/infra/run.sh
 	@if command -v shellcheck >/dev/null; then \
-	  shellcheck -x -e SC1091 infra/runpod/apply.sh infra/runpod/lib.sh scripts/smoke-job.sh; \
+	  shellcheck -x -e SC1091 infra/runpod/apply.sh infra/runpod/lib.sh scripts/smoke-job.sh tests/infra/run.sh; \
 	else \
 	  echo "shellcheck not installed: skipped (only bash -n ran). Install: pip install shellcheck-py"; \
 	fi

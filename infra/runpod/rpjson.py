@@ -83,6 +83,16 @@ def emit(obj):
     sys.stdout.write(json.dumps(obj, separators=(",", ":"), sort_keys=True))
 
 
+def queue_delay():
+    try:
+        q = float(env("EP_QUEUE_DELAY", "4"))
+    except ValueError:
+        sys.exit("rpjson: RUNPOD_QUEUE_DELAY_S must be a number")
+    if q < 0.5:
+        sys.exit("rpjson: RUNPOD_QUEUE_DELAY_S must be at least 0.5")
+    return int(q) if q == int(q) else q
+
+
 def build_endpoint():
     timeout_ms = int(env("EP_TIMEOUT_MS"))
     e = {
@@ -104,7 +114,7 @@ def build_endpoint():
         "mounts": {"network": [{"volumeId": env("EP_VOLUME_ID")}]},
         "workers": {"min": int(env("EP_MIN")), "max": int(env("EP_MAX")),
                     "idleTimeout": int(env("EP_IDLE"))},
-        "scaling": {"type": "QUEUE_DELAY", "queueDelay": int(env("EP_QUEUE_DELAY", "4"))},
+        "scaling": {"type": "QUEUE_DELAY", "queueDelay": queue_delay()},
         "flashboot": "FLASHBOOT",  # REST default is OFF: always send it
         "timeout": timeout_ms,  # milliseconds
         "disk": int(env("EP_DISK", "20")),

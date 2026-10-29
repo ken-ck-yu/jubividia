@@ -13,6 +13,7 @@
 #    pod | endpoint | secret_hf. There is no way to delete a network volume or the two R2
 #    secrets from this code (tests/infra/run.sh greps for that).
 
+# shellcheck disable=SC2034  # shared settings (TOOL_NAME, API_BASE, RUN_BASE, POD_NAME, ...) are read by the scripts that source this file
 case $- in *x*) echo "refusing to run under bash -x: a trace would print secret values" >&2; exit 2 ;; esac
 if [[ ${SHELLOPTS:-} == *xtrace* || -n ${BASH_XTRACEFD:-} ]]; then
   echo "refusing to run with xtrace enabled (SHELLOPTS/BASH_XTRACEFD): it would print secret values" >&2
@@ -33,8 +34,14 @@ RUN_BASE=${RUNPOD_RUN_BASE:-https://api.runpod.ai/v2}
 # Test mode (set by tests/infra/run.sh): every URL this code requests must be on 127.0.0.1,
 # so a test can never reach a real host. Checked again right before each curl.
 RUNPOD_TEST_MODE=${RUNPOD_TEST_MODE:-0}
+# Anchored: exactly http://127.0.0.1:<port> then an optional /path?query of plain characters.
+# No userinfo (@), fragment (#), backslash, whitespace or anything else a URL parser could
+# reinterpret as a different host.
+LOOPBACK_RE='^http://127\.0\.0\.1:[0-9]{1,5}(/[A-Za-z0-9._~/%:+=,-]*)?(\?[A-Za-z0-9._~/%:+=,&-]*)?$'
+CURL_NOPROXY=()   # test mode adds --noproxy '*' so loopback traffic can never go to a proxy
+if [[ $RUNPOD_TEST_MODE == 1 ]]; then CURL_NOPROXY=(--noproxy '*'); fi
 assert_url_allowed() {
-  if [[ $RUNPOD_TEST_MODE == 1 && $1 != http://127.0.0.1:* ]]; then
+  if [[ $RUNPOD_TEST_MODE == 1 && ! $1 =~ $LOOPBACK_RE ]]; then
     printf '%s: TEST MODE refuses non-loopback URL %s\n' "${TOOL_NAME:-apply}" "${1%%\?*}" >&2
     exit 4
   fi
@@ -152,10 +159,10 @@ http() {
   [[ -n ${CFG[RUNPOD_API_KEY]-} ]] || die "RUNPOD_API_KEY is not set in $CONFIG_ENV"
   assert_url_allowed "$url"
   if [[ -n $body ]]; then
-    out=$(printf '%s' "$body" | curl -sS --max-time "${HTTP_MAX_TIME:-60}" -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
+    out=$(printf '%s' "$body" | curl -sS "${CURL_NOPROXY[@]}" --max-time "${HTTP_MAX_TIME:-60}" -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
       -H 'Content-Type: application/json' --data-binary @- -w '\n%{http_code}' "$url" 2>/dev/null) || true
   else
-    out=$(curl -sS --max-time "${HTTP_MAX_TIME:-60}" -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
+    out=$(curl -sS "${CURL_NOPROXY[@]}" --max-time "${HTTP_MAX_TIME:-60}" -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
       -w '\n%{http_code}' "$url" </dev/null 2>/dev/null) || true
   fi
   API_STATUS=${out##*$'\n'}

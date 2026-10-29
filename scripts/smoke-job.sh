@@ -2,7 +2,7 @@
 # Real-GPU gate runner for the jubividia endpoint (docs/decisions/endpoint.md, "Real-GPU gating plan").
 # BILLABLE: every job runs on a RunPod RTX 6000 Ada ($1.75/hr). Run only after Ken has seen the quote.
 #
-#   scripts/smoke-job.sh [--no-r2-check] [--skip-final-cold] [--csv PATH]
+#   scripts/smoke-job.sh [--max-spend USD] [--no-r2-check] [--skip-final-cold] [--csv PATH]
 #
 # Order (cheapest checks first):
 #   1 canary     missing-input i2v job. Needs good R2 secrets, never loads models.
@@ -11,15 +11,23 @@
 #   4 warm-def   1280x704x121 @24 fps
 #   5 warm-def2  same again: must be within 10% of #4 (no encoder eviction / reload)
 #   6 wait for scale to zero, then 7 cold-def: the user's real "first job after idle" path
-# Uses /run + /status + /health only (never /runsync: it sits behind a ~100 s edge timeout).
+# Uses /run + /status + /health + /cancel only (never /runsync: it sits behind a ~100 s edge timeout).
+# The run URL comes from the endpoint's `requestUrls` (GET /serverless/<id>) when present, else RUNPOD_RUN_BASE.
 # Cold start = delayTime + executionTime of a job, minus its gen_time_s.
-# Stops (exit 3) and asks Ken when: a worker goes Unhealthy; a job stays IN_PROGRESS past 15 min;
-# a job waits in the queue with no usable worker (throttled) past 5 min; cold start > 600 s;
+# Canary: passes when the error is "[input_fetch] input not found" (a missing key failing inside input_fetch
+# proves the R2 credentials resolved), with or without a separate error_code field (a missing field is noted).
+# Anything else at the canary stops the gate right there, before any model job runs.
+# Stops (exit 3) and asks Ken when: the canary shows unresolved secrets or another error; a worker goes
+# Unhealthy; a job stays IN_PROGRESS past 15 min (a cancel is sent); a job waits in the queue with no
+# usable worker (throttled) past 5 min; /status fails 5 polls in a row (cancel sent); estimated spend
+# (worker time x $1.75/hr) reaches --max-spend (default 1.50 USD; cancel sent); cold start > 600 s;
 # cold-tiny start + warm default gen_time > 700 s; warm gen_time > 300 s.
 # Exit codes: 0 gate passed, 1 gate failed, 2 usage/config, 3 stop-and-ask.
 # Output never contains the API key or R2 secrets (lib.sh redact()).
 set -euo pipefail
+# shellcheck disable=SC2034  # read by die() in lib.sh
 TOOL_NAME=smoke-job
+export LC_ALL=C   # awk/EPOCHREALTIME decimal point
 # shellcheck source=../infra/runpod/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../infra/runpod/lib.sh"
 
@@ -27,9 +35,12 @@ R2_CHECK=1
 FINAL_COLD=1
 CSV=${SMOKE_CSV:-$ROOT/docs/validation/endpoint-timings.csv}
 POLL_S=${SMOKE_POLL_S:-5}
+POLL_FAIL_LIMIT=${SMOKE_POLL_FAIL_LIMIT:-5}
 MAX_INPROGRESS_S=${SMOKE_MAX_INPROGRESS_S:-900}
 QUEUE_STOP_S=${SMOKE_QUEUE_STOP_S:-300}
 IDLE_WAIT_S=${SMOKE_IDLE_WAIT_S:-600}
+MAX_SPEND=1.50
+WORKER_USD_PER_HR=1.75
 COLD_FLAG_S=180
 COLD_HARD_S=600
 SUM_STOP_S=700
@@ -41,27 +52,66 @@ while (($#)); do
     --no-r2-check) R2_CHECK=0 ;;
     --skip-final-cold) FINAL_COLD=0 ;;
     --csv) (($# >= 2)) || die "--csv needs a path"; CSV=$2; shift ;;
-    -h | --help) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --max-spend)
+      (($# >= 2)) || die "--max-spend needs a value"
+      [[ $2 =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "--max-spend needs a number of US dollars"
+      MAX_SPEND=$2; shift ;;
+    -h | --help) sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument $1" ;;
   esac
   shift
 done
 
 read_config
-need_cfg RUNPOD_API_KEY RUNPOD_ENDPOINT_ID
+need_cfg RUNPOD_API_KEY RUNPOD_ENDPOINT_ID IMAGE_TAG
+valid_image_tag "$(cfg IMAGE_TAG)" || die "IMAGE_TAG must match ^sha-[0-9a-f]{7,}\$ (refusing to run the gate without a pinned image tag)"
 EP=$(cfg RUNPOD_ENDPOINT_ID)
+EXEC_S=$(($(cfg RUNPOD_EXEC_TIMEOUT_MS 900000) / 1000))
 FAILS=()
 NOTES=()
+SPEND_S=0
+BILLING=0
+LAST_TICK=$EPOCHREALTIME
+CUR_JOB=
+
+# Runtime base for this endpoint: requestUrls.run from the endpoint (minus the trailing /run), else the default.
+EP_URL="$RUN_BASE/$EP"
+http GET "$API_BASE/serverless/$EP"
+if api_ok; then
+  run_url=$(json_get requestUrls.run)
+  if [[ $run_url =~ ^(https?://[^[:space:]@#]+)/run$ ]]; then EP_URL=${BASH_REMATCH[1]}; fi
+fi
+unset run_url
 
 stop() { # stop REASON  -> exit 3
   say ""
   say "STOP AND ASK KEN: $1"
+  say "Estimated spend so far: \$$(spend_usd) of the \$${MAX_SPEND} cap."
   say "Do not work around it and do not retry blindly. Check /health and the worker logs, then report the evidence."
   exit 3
 }
 
+awkf() { awk "$@"; }
+spend_usd() { awkf -v s="$SPEND_S" -v r="$WORKER_USD_PER_HR" 'BEGIN{printf "%.4f", s*r/3600}'; }
+
+cancel_job() { # best effort, stops the spend on a job we are giving up on
+  if [[ -n $CUR_JOB ]]; then http POST "$EP_URL/cancel/$CUR_JOB"; fi
+}
+
+tick() { # accumulate worker time while something is billing, then enforce the spend cap
+  local n=$EPOCHREALTIME
+  if ((BILLING)); then
+    SPEND_S=$(awkf -v s="$SPEND_S" -v a="$LAST_TICK" -v b="$n" 'BEGIN{printf "%.4f", s+(b-a)}')
+  fi
+  LAST_TICK=$n
+  if awkf -v c="$(spend_usd)" -v m="$MAX_SPEND" 'BEGIN{exit !(c>=m)}'; then
+    cancel_job
+    stop "estimated spend \$$(spend_usd) reached --max-spend \$${MAX_SPEND}."
+  fi
+}
+
 health() { # sets H_UNHEALTHY H_THROTTLED H_IDLE H_RUNNING H_INIT
-  http GET "$RUN_BASE/$EP/health"
+  http GET "$EP_URL/health"
   H_UNHEALTHY=0 H_THROTTLED=0 H_IDLE=0 H_RUNNING=0 H_INIT=0
   api_ok || return 1
   H_UNHEALTHY=$(json_get workers.unhealthy); H_UNHEALTHY=${H_UNHEALTHY:-0}
@@ -71,45 +121,61 @@ health() { # sets H_UNHEALTHY H_THROTTLED H_IDLE H_RUNNING H_INIT
   H_INIT=$(json_get workers.initializing); H_INIT=${H_INIT:-0}
 }
 
-awkf() { awk "$@"; }
-
 # run_job LABEL INPUT_JSON -> J_STATUS J_ID J_DELAY J_EXEC J_GEN J_COLD J_KEY J_THUMB J_META J_VRAM J_START
-# and J_RAW_KEYS (names of the /status fields), J_ERR (error text)
+# J_ERR (error text) J_ERRCODE J_FIELDS (names of the /status fields)
 run_job() {
-  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting
+  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting fails=0
   say ""
   say "--- $label: submitting"
   if health; then say "    health: idle=$H_IDLE running=$H_RUNNING initializing=$H_INIT throttled=$H_THROTTLED unhealthy=$H_UNHEALTHY"
   else say "    (health unavailable: HTTP $API_STATUS)"; fi
-  http POST "$RUN_BASE/$EP/run" "{\"input\":$input}"
+  http POST "$EP_URL/run" "{\"input\":$input}"
   api_ok || die "$label: POST /run failed: HTTP $API_STATUS ${API_BODY:0:300}"
   J_ID=$(json_get id)
   [[ -n $J_ID ]] || die "$label: /run returned no job id"
+  CUR_JOB=$J_ID
   say "    job $J_ID"
   t0=$SECONDS
+  LAST_TICK=$EPOCHREALTIME
   while :; do
     sleep "$POLL_S"
-    http GET "$RUN_BASE/$EP/status/$J_ID"
-    api_ok || { warn "status HTTP $API_STATUS"; continue; }
-    st=$(json_get status)
+    http GET "$EP_URL/status/$J_ID"
     now=$((SECONDS - t0))
-    if [[ $st != "$last" ]]; then say "    [${now}s] $st"; last=$st; fi
-    case $st in
-      COMPLETED | FAILED | CANCELLED | TIMED_OUT) break ;;
-      IN_PROGRESS) ((in_progress_since >= 0)) || in_progress_since=$now ;;
-    esac
+    st=
+    if api_ok; then st=$(json_get status); fi
+    if [[ -z $st ]]; then
+      # 401/500/000 or a non-JSON body: count it, but keep enforcing every other check below
+      fails=$((fails + 1))
+      warn "status poll failed ($fails/$POLL_FAIL_LIMIT): HTTP $API_STATUS"
+      if ((fails >= POLL_FAIL_LIMIT)); then
+        cancel_job
+        stop "$label: /status failed $fails polls in a row (last HTTP $API_STATUS). Job $J_ID may still be running; a cancel was sent."
+      fi
+    else
+      fails=0
+      if [[ $st != "$last" ]]; then say "    [${now}s] $st"; last=$st; fi
+      case $st in
+        COMPLETED | FAILED | CANCELLED | TIMED_OUT) break ;;
+        IN_PROGRESS) if ((in_progress_since < 0)); then in_progress_since=$now; fi ;;
+      esac
+    fi
+    BILLING=0
+    if [[ $last == IN_PROGRESS ]]; then BILLING=1; fi
     if health; then
       ((H_UNHEALTHY == 0)) || stop "$label: a worker is Unhealthy (unhealthy=$H_UNHEALTHY). Job $J_ID may still be billing; cancel it only after Ken agrees."
       waiting=$((H_IDLE + H_RUNNING + H_INIT))
-      if [[ $st == IN_QUEUE ]] && ((now > QUEUE_STOP_S)) && ((H_THROTTLED > 0 || waiting == 0)); then
+      if ((waiting > 0)); then BILLING=1; fi
+      if [[ $last == IN_QUEUE ]] && ((now > QUEUE_STOP_S)) && ((H_THROTTLED > 0 || waiting == 0)); then
         stop "$label: IN_QUEUE for ${now}s with throttled=$H_THROTTLED and no usable worker: the RTX 6000 Ada cannot be acquired (stock). Ask before widening the pool or moving DC."
       fi
     fi
     if ((in_progress_since >= 0 && now - in_progress_since > MAX_INPROGRESS_S)); then
-      http POST "$RUN_BASE/$EP/cancel/$J_ID" "{}" || true
+      cancel_job
       stop "$label: job $J_ID stayed IN_PROGRESS for more than ${MAX_INPROGRESS_S}s; a cancel was sent to stop the spend."
     fi
+    tick
   done
+  CUR_JOB=
   J_STATUS=$st
   J_DELAY=$(json_get delayTime); J_EXEC=$(json_get executionTime)
   J_GEN=$(json_get output.gen_time_s); J_COLD=$(json_get output.cold)
@@ -147,6 +213,9 @@ record_csv() {
 r2_check() {
   need_cfg R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET
   if ! command -v aws >/dev/null; then J_AUDIO=unchecked; NOTES+=("$1: R2 check skipped (aws CLI missing)"); say "    R2 check SKIPPED: aws CLI not installed"; return 0; fi
+  if [[ $RUNPOD_TEST_MODE == 1 && ${SMOKE_ALLOW_STUB_AWS:-0} != 1 ]]; then
+    J_AUDIO=unchecked; NOTES+=("$1: R2 check skipped (test mode, no stub aws)"); say "    R2 check SKIPPED: test mode refuses a real aws/Cloudflare call"; return 0
+  fi
   local k tmp ctype ep=https://${CFG[R2_ACCOUNT_ID]}.r2.cloudflarestorage.com
   tmp=$(mktemp -d)
   for k in "$J_KEY" "$J_THUMB" "$J_META"; do
@@ -177,11 +246,11 @@ check_cold() { # LABEL: flag > 180 s, stop > 600 s
 }
 
 require_completed() { # LABEL
-  [[ $J_STATUS == COMPLETED ]] || {
+  if [[ $J_STATUS != COMPLETED ]]; then
     FAILS+=("$1: job ended $J_STATUS (${J_ERR:-no error text})")
-    [[ $J_ERR == *oom* || $J_ERRCODE == oom ]] && FAILS+=("$1: OOM")
+    if [[ $J_ERR == *oom* || $J_ERRCODE == oom ]]; then FAILS+=("$1: OOM"); fi
     summary
-  }
+  fi
 }
 
 summary() {
@@ -189,9 +258,10 @@ summary() {
   say ""
   say "================ GATE SUMMARY ================"
   say "csv: $CSV"
+  say "estimated spend: \$$(spend_usd) (worker time x \$${WORKER_USD_PER_HR}/hr, cap \$${MAX_SPEND})"
   say "peak VRAM is report-only (nvidia-smi includes the allocator reserve; 46 GiB = ${VRAM_REPORT_MB} MiB): cold-tiny=${V_COLD_TINY:-n/a} warm-def=${V_WARM_DEF:-n/a} warm-def2=${V_WARM_DEF2:-n/a} cold-def=${V_COLD_DEF:-n/a} MiB"
   say "offload: NOT detectable from job data; grep the worker logs for offload/lowvram messages and report them."
-  for n in "${NOTES[@]-}"; do [[ -n $n ]] && say "note: $n"; done
+  for n in "${NOTES[@]-}"; do if [[ -n $n ]]; then say "note: $n"; fi; done
   if ((${#FAILS[@]})); then
     for f in "${FAILS[@]}"; do say "FAIL: $f"; done
     say "GATE: FAIL"
@@ -206,26 +276,25 @@ TINY='{"mode":"t2v","prompt":"a red ball rolls across a wooden table, soft ambie
 DEF='{"mode":"t2v","prompt":"a red ball rolls across a wooden table in a sunlit room, soft ambient sound","width":1280,"height":704,"num_frames":121,"fps":24,"seed":1234}'
 CANARY='{"mode":"i2v","prompt":"smoke canary","input_key":"inputs/__smoke_missing__.png","width":256,"height":256,"num_frames":25}'
 
-say "gate against endpoint $EP ($RUN_BASE). Billable: RTX 6000 Ada \$1.75/hr."
+say "gate against endpoint $EP ($EP_URL). Billable: RTX 6000 Ada \$1.75/hr, spend cap \$${MAX_SPEND}."
 
 # 1 canary
 run_job canary "$CANARY"
 if [[ $J_STATUS != FAILED ]]; then
   FAILS+=("canary: expected FAILED, got $J_STATUS"); summary
 fi
-if [[ $J_ERR == *"input not found"* ]]; then
-  say "    canary OK: R2 secrets resolved and R2 read works (input_fetch / input not found)"
+if [[ $J_ERR == "[input_fetch] input not found"* && ( -z $J_ERRCODE || $J_ERRCODE == input_fetch ) ]]; then
+  say "    canary OK: R2 credentials resolved and R2 read works (input_fetch / input not found)"
+  if [[ -z $J_ERRCODE ]]; then
+    NOTES+=("canary: /status has no separate error_code field; the [input_fetch] prefix in the error text is the accepted safeguard")
+  fi
 else
-  stop "canary: unexpected error '${J_ERR:-?}'. 'could not fetch input' or config_error means the R2 secrets did not resolve or lack read access. Fix before any model load."
-fi
-if [[ -z $J_ERRCODE ]]; then
-  FAILS+=("canary: /status exposes no error_code field (only the [code] prefix); contract assumption broken")
+  stop "canary: unexpected failure '${J_ERR:-?}' (error_code '${J_ERRCODE:-none}'). 'could not fetch input', config_error, an auth error or any other prefix means the R2 secrets did not resolve or lack read access. Fix before any model load."
 fi
 
 # 2 cold tiny
 run_job cold-tiny "$TINY"; require_completed cold-tiny
 V_COLD_TINY=$J_VRAM
-COLD_TINY_START=$J_START
 COLD_TINY_TOTAL=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" 'BEGIN{printf "%.1f",(d+e)/1000}')
 check_cold cold-tiny
 [[ $J_COLD == true ]] || NOTES+=("cold-tiny: cold flag was '$J_COLD' (judge cold by delayTime, not by the flag)")
@@ -257,8 +326,14 @@ if ((FINAL_COLD)); then
   say ""
   say "--- waiting for the worker to scale to zero (idle timeout 60 s), up to ${IDLE_WAIT_S}s"
   w0=$SECONDS
+  LAST_TICK=$EPOCHREALTIME
   while :; do
-    if health && ((H_IDLE + H_RUNNING + H_INIT == 0)); then break; fi
+    BILLING=1
+    if health; then
+      if ((H_IDLE + H_RUNNING + H_INIT == 0)); then BILLING=0; fi
+    fi
+    tick
+    if ((BILLING == 0)); then break; fi
     ((SECONDS - w0 < IDLE_WAIT_S)) || stop "worker did not scale to zero within ${IDLE_WAIT_S}s: idle timeout may not be 60 s; check the endpoint (it is billing)."
     sleep "$POLL_S"
   done
@@ -267,7 +342,7 @@ if ((FINAL_COLD)); then
   check_cold cold-def
   [[ $J_COLD == true ]] || NOTES+=("cold-def: cold flag was '$J_COLD' (FlashBoot restore or surviving process?); judge by delayTime")
   TOTAL=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" 'BEGIN{printf "%.1f",(d+e)/1000}')
-  say "    user path (cold + default clip): ${TOTAL}s of the 780 s generation budget / 900 s execution timeout"
+  say "    user path (cold + default clip): ${TOTAL}s of the 780 s generation budget / ${EXEC_S} s execution timeout"
   if num_gt "$TOTAL" 780; then FAILS+=("cold-def: delay+exec ${TOTAL}s exceeds the 780 s job budget"); fi
 fi
 summary

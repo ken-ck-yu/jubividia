@@ -4,6 +4,7 @@
 #   preflight  volume  secrets  endpoint  pod-up  pod-logs  pod-down  status  teardown-endpoint
 # See infra/runpod/README.md and docs/decisions/endpoint.md. Nothing here is free to
 # run for real: volume/pod/endpoint creation bill. --dry-run makes no writes.
+# shellcheck disable=SC2015  # "A && B || die ..." is deliberate validation: die exits, so it can not run after a pass
 set -euo pipefail
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -17,7 +18,18 @@ CMD=
 usage() { sed -n '2,6p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # Test hook: simulate the process dying between "create" and "write the id back".
-maybe_die_after_create() { [[ ${APPLY_TEST_KILL_AFTER_CREATE-} == "$1" ]] && kill -9 $$; return 0; }
+# Only honoured in test mode, so a stray exported variable can never kill a real run.
+maybe_die_after_create() {
+  if [[ $RUNPOD_TEST_MODE == 1 && ${APPLY_TEST_KILL_AFTER_CREATE-} == "$1" ]]; then kill -9 $$; fi
+  return 0
+}
+
+# count_ids PATH key=val...: how many items match; dies on an API error or a second page.
+count_ids() {
+  local ids
+  ids=$(find_ids "$@") || exit 1
+  printf '%s\n' "$ids" | grep -c . || true
+}
 
 # ---------------------------------------------------------------- derived settings
 image_ref() {
@@ -35,6 +47,9 @@ tune_json() {
   for k in JOB_TIMEOUT_S COMFY_READY_TIMEOUT_S INPUT_MAX_BYTES POLL_INTERVAL_S VRAM_SAMPLE_S; do
     if [[ -n ${CFG[$k]-} ]]; then
       [[ ${CFG[$k]} =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$k must be a number"
+      if [[ $k == VRAM_SAMPLE_S ]] && ! awk -v v="${CFG[$k]}" 'BEGIN{exit !(v>=0.2)}'; then
+        die "VRAM_SAMPLE_S must be at least 0.2 (a smaller value would fork nvidia-smi in a tight loop)"
+      fi
       parts+=("\"$k\":\"${CFG[$k]}\"")
     fi
   done
@@ -84,9 +99,9 @@ ghcr_check() {
   repo=${repo#ghcr.io/}
   base=${GHCR_BASE:-https://ghcr.io}
   assert_url_allowed "$base"
-  token=$(curl -sS --max-time 30 "$base/token?service=ghcr.io&scope=repository:$repo:pull" 2>/dev/null | pyj get token) || true
+  token=$(curl -sS "${CURL_NOPROXY[@]}" --max-time 30 "$base/token?service=ghcr.io&scope=repository:$repo:pull" 2>/dev/null | pyj get token) || true
   [[ -n $token ]] || die "GHCR: could not get an anonymous pull token for $repo (is the package public?)"
-  code=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -I \
+  code=$(curl -sS "${CURL_NOPROXY[@]}" --max-time 30 -o /dev/null -w '%{http_code}' -I \
     -H "Authorization: Bearer $token" \
     -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
     "$base/v2/$repo/manifests/$tag" 2>/dev/null) || true
@@ -104,13 +119,13 @@ cmd_preflight() {
   api_must "API key / base URL check (GET /serverless at $API_BASE)"
   say "ok   RunPod API reachable, key accepted"
   ((SKIP_GHCR)) || ghcr_check
-  n=$(find_ids /network-volumes "name=$(cfg RUNPOD_VOLUME_NAME jubividia-ltx-us-wa1)" "dataCenter=$(cfg RUNPOD_DC US-WA-1)" "type=STANDARD" | grep -c .) || true
+  n=$(count_ids /network-volumes "name=$(cfg RUNPOD_VOLUME_NAME jubividia-ltx-us-wa1)" "dataCenter=$(cfg RUNPOD_DC US-WA-1)" "type=STANDARD")
   say "info volumes with the exact name+DC: $n (0 = volume will be created, 1 = adopted, >1 = stop)"
-  n=$(find_ids /serverless "name=$(cfg RUNPOD_ENDPOINT_NAME jubividia-ltx25)" | grep -c .) || true
+  n=$(count_ids /serverless "name=$(cfg RUNPOD_ENDPOINT_NAME jubividia-ltx25)")
   say "info endpoints with the exact name: $n"
-  n=$(find_ids /account/secrets "name=$SECRET_R2_KEY_ID" | grep -c .) || true
+  n=$(count_ids /account/secrets "name=$SECRET_R2_KEY_ID")
   say "info secret $SECRET_R2_KEY_ID: $n"
-  n=$(find_ids /account/secrets "name=$SECRET_R2_KEY_SECRET" | grep -c .) || true
+  n=$(count_ids /account/secrets "name=$SECRET_R2_KEY_SECRET")
   say "info secret $SECRET_R2_KEY_SECRET: $n"
   say "TODO (not checkable here): confirm payment method and balance (~\$15) in the console; re-read RTX 6000 Ada stock at the DC and CPU stock right before each billable step."
 }
@@ -128,6 +143,9 @@ cmd_volume() {
     api GET "/network-volumes/$id"
     ((API_STATUS != 404)) || die "RUNPOD_NETWORK_VOLUME_ID=$id does not exist on this account; clear it in config.env if you really want a new volume"
     api_must "GET /network-volumes/$id"
+    # the id came from config.env: make sure it really is the volume we mean (one-way choices)
+    [[ $(json_get dataCenter) == "$dc" && $(json_get type) == STANDARD ]] \
+      || die "volume $id is in '$(json_get dataCenter)' / type '$(json_get type)', expected $dc / STANDARD; refusing to use it"
   else
     ids=$(find_ids /network-volumes "name=$name" "dataCenter=$dc" "type=STANDARD")
     n=$(printf '%s\n' "$ids" | grep -c .) || true
@@ -155,6 +173,7 @@ cmd_volume() {
   if [[ $cur =~ ^[0-9]+$ ]]; then
     if ((cur > gb)); then die "volume is $cur GB and RUNPOD_VOLUME_GB is $gb: volumes can only grow, refusing to shrink"; fi
     if ((cur < gb)); then
+      ((YES)) || die "volume $id is $cur GB, config wants $gb GB. Growing is billable and one-way: re-run with --yes to grow it."
       say "growing volume $id from $cur to $gb GB"
       api PATCH "/network-volumes/$id" "$(V_GB=$gb pyj body-volume-size)" show
       api_must "grow volume"
@@ -277,6 +296,7 @@ cmd_pod_up() {
   n=$(printf '%s\n' "$ids" | grep -c .) || true
   ((n == 0)) || die "pod '$POD_NAME' already exists ($(printf '%s' "$ids" | tr '\n' ' ')); run pod-logs or pod-down first"
   ensure_hf_secret
+  say "note: the temporary secret $SECRET_HF now exists on the account; if pod creation fails, run 'apply.sh pod-down' to delete it"
   body=$(
     export POD_NAME POD_SECRET_HF="$SECRET_HF" POD_GIT_REF="$ref" POD_IMAGE="$pimg"
     export POD_DC POD_VOLUME_ID POD_CPU_ID POD_VCPU POD_SKIP_MOUNT_CHECK
@@ -325,7 +345,8 @@ ensure_hf_secret() {
 }
 
 resolve_pod() { # prints the id of the pod named exactly $POD_NAME, or nothing
-  local id=$(cfg RUNPOD_POD_ID) ids n
+  local id ids n
+  id=$(cfg RUNPOD_POD_ID)
   if [[ -n $id ]]; then
     api GET "/pods/$id"
     if api_ok && [[ $(json_get name) == "$POD_NAME" ]]; then printf '%s' "$id"; return 0; fi
@@ -388,7 +409,7 @@ cmd_status() {
   else say "   none recorded"; fi
   say "== secrets"
   for k in "$SECRET_R2_KEY_ID" "$SECRET_R2_KEY_SECRET"; do
-    say "   $k: $(find_ids /account/secrets "name=$k" | grep -c . || true) found"
+    say "   $k: $(count_ids /account/secrets "name=$k") found"
   done
   say "== endpoint"
   id=$(cfg RUNPOD_ENDPOINT_ID)
