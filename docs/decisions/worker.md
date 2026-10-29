@@ -164,3 +164,7 @@ Architect Q1–Q8 accepted as recommended; Q9 and the input mechanism decided as
 - Error text is `[code] message` with `error_code` also kept as a field, in case RunPod `/status` hides the structured field. No job-level retry beyond the bounded upload retry: fail and resubmit.
 - The repo is **public** and the GHCR package is expected to be public. Verify package visibility after the first CI run.
 - Still unverified until the `endpoint` feature (see `docs/validation/worker.md`): real generation and int8-convrot speed/VRAM on the RTX 6000 Ada (Ken's decision-8 gate; pass/fail thresholds not yet set), real R2 upload, whether `/status` exposes `error_code`, and the first CI run on the 24.75 GB image.
+
+## Invariant for the UI gallery (added by the ui feature)
+
+The handler uploads the .mp4 and .jpg first and the .json sidecar LAST, and deletes the earlier files if the sidecar upload fails (upload_results in worker/handler.py). The UI gallery lists sidecars only and treats a sidecar as the "clip is complete" marker. Do not change this order without changing ui/src/outputs.js. Sidecar fields the UI reads: mode, prompt, seed, width, height, num_frames, fps, gen_time_s, peak_vram_mb, cold, created_at (missing fields render blank).

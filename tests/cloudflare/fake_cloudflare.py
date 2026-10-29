@@ -93,6 +93,8 @@ class H(BaseHTTPRequestHandler):
 
     def handle_any(self, method):
         path = self.path.split("?")[0]
+        if path.startswith("/client/v4/"):
+            path = path[len("/client/v4"):]
         body = self.body()
         with LOCK:
             if path.startswith("/__ctl/"):
@@ -130,7 +132,9 @@ class H(BaseHTTPRequestHandler):
             return None
         q = p[len(pre):]
         if q == "/workers/subdomain" and m == "GET":
-            return 200, env({"subdomain": STATE["subdomain"]}) if STATE["subdomain"] else (404, env(None, False, [{"code": 10007, "message": "no subdomain"}]))
+            if not STATE["subdomain"]:
+                return 404, env(None, False, [{"code": 10007, "message": "no subdomain"}])
+            return 200, env({"subdomain": STATE["subdomain"]})
         if q == "/workers/scripts" and m == "GET":
             return 200, env(list(STATE["scripts"].values()))
         mm = re.match(r"^/workers/scripts/([^/]+)/subdomain$", q)

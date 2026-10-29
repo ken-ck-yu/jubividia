@@ -1,0 +1,7 @@
+# Names only. Copy to .dev.vars (git-ignored) for `npm run dev`. The Worker has no auth bypass:
+# TEAM_DOMAIN must serve /cdn-cgi/access/certs and requests must carry a matching Access JWT.
+RUNPOD_API_KEY=
+RUNPOD_ENDPOINT_ID=
+ALLOWED_EMAILS=
+TEAM_DOMAIN=
+POLICY_AUD=

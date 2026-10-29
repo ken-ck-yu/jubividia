@@ -29,6 +29,9 @@ usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 SUBDOMAIN=
 read_subdomain() {
   cf GET "/accounts/$ACCOUNT/workers/subdomain"
+  if [[ $API_STATUS == 404 ]]; then
+    die "the account has no workers.dev subdomain. STOP and ask Ken: it is account-wide and this tool never creates or renames it."
+  fi
   api_must "read the workers.dev subdomain"
   SUBDOMAIN=$(json_get result.subdomain)
   [[ $SUBDOMAIN =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
