@@ -1,0 +1,13 @@
+# ComfyUI loads /comfyui/extra_model_paths.yaml automatically at start.
+# Replaces the stock file (which lacks diffusion_models/text_encoders/
+# latent_upscale_models). Layout is the contract with the `models` feature.
+# Workflows must reference model FILENAMES only, never paths.
+runpod_volume:
+  base_path: /runpod-volume/models
+  diffusion_models: diffusion_models/
+  text_encoders: text_encoders/
+  vae: vae/
+  latent_upscale_models: latent_upscale_models/
+  loras: loras/
+  checkpoints: checkpoints/
+  model_patches: model_patches/
