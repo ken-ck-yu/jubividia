@@ -8,4 +8,8 @@ test-models:
 
 lint-models:
 	bash -n scripts/download-models.sh
-	shellcheck scripts/download-models.sh tests/models/run.sh
+	@if command -v shellcheck >/dev/null; then \
+	  shellcheck scripts/download-models.sh tests/models/run.sh; \
+	else \
+	  echo "shellcheck not installed: skipped (only bash -n ran). Install: pip install shellcheck-py"; \
+	fi

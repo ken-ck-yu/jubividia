@@ -53,6 +53,8 @@ SKIP_MOUNT_CHECK=1 (escape hatch if the mountpoint check wrongly fails on a pod)
 EOF
 }
 
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || die "JOBS must be an integer >= 1 (got '$JOBS')"
+
 while (($#)); do
   case $1 in
     --verify) ACTION=verify ;;
@@ -120,8 +122,12 @@ refuse_if_pending() {
 
 # ---------------------------------------------------------------- token / curl
 require_token() {
-  # length check only: expanding the token here would show it under 'bash -x'
+  local - bad='[[:space:][:cntrl:]"\\]'
+  set +x # never trace expansions of the token
   { [[ -v HF_TOKEN ]] && ((${#HF_TOKEN} > 0)); } || die "HF_TOKEN is not set. Export a read-only Hugging Face token (env var only)."
+  if [[ $HF_TOKEN =~ $bad ]]; then
+    die "HF_TOKEN contains whitespace, a newline or another invalid character (a stray newline from pasting is common). Re-enter it without them. (The token is not shown.)"
+  fi
 }
 
 # Emits a curl config on stdout so the token never appears in argv. xtrace is
@@ -161,6 +167,18 @@ resolve_volume() {
   MODELS_DIR=$VOLUME_ROOT/models
 }
 
+# One download/prune run per volume at a time (the lock file lives on the volume,
+# so it also covers two pods). Held until the script exits.
+acquire_run_lock() {
+  mkdir -p "$MODELS_DIR"
+  if ! command -v flock >/dev/null; then
+    log "WARNING: flock not found; concurrent runs are not prevented"
+    return 0
+  fi
+  exec 9>"$MODELS_DIR/.run.lock"
+  flock -n 9 || die "another download-models run is already using $VOLUME_ROOT (lock $MODELS_DIR/.run.lock). Wait for it to finish."
+}
+
 # ---------------------------------------------------------------- actions
 do_list() {
   local i
@@ -192,7 +210,7 @@ do_prune() {
   [[ -d $MODELS_DIR ]] || { log "nothing to prune: $MODELS_DIR missing"; return 0; }
   while IFS= read -r -d '' f; do
     rel=${f#"$MODELS_DIR"/}
-    [[ $rel == .manifest-rev ]] && continue
+    [[ $rel == .manifest-rev || $rel == .run.lock ]] && continue
     base=${rel%.partial}
     [[ -n ${IN_LOCK[$base]:-} ]] && continue
     n=$((n + 1))
@@ -280,7 +298,8 @@ do_download() {
   refuse_if_pending
   require_token
   check_curl
-  mkdir -p "$MODELS_DIR"
+  acquire_run_lock
+  for f in "${LOCK_PATH[@]}"; do mkdir -p "$MODELS_DIR/${f%/*}"; done # incl. empty loras/
   log "repo $LOCK_REPO at pinned commit $LOCK_REV (${LOCK_REV_DATE:-date unknown})"
   declare -gA STATE=()
   local todo=()
@@ -299,6 +318,8 @@ do_download() {
   prune_orphan_partials
 
   if ((${#todo[@]} > 0)); then
+    log "volume $VOLUME_ROOT (check the size and type match the network volume, ~80 GB):"
+    df -hT "$VOLUME_ROOT" >&2 || true
     free=$(df -Pk "$VOLUME_ROOT" | awk 'NR==2{print $4*1024}')
     if ((free < need + FREE_SLACK_BYTES)); then
       die "not enough free space on $VOLUME_ROOT: need $((need + FREE_SLACK_BYTES)) bytes (missing files + slack), have $free. Run --prune, or grow the volume."
@@ -426,7 +447,7 @@ case $ACTION in
   list) do_list ;;
   update-lock) do_update_lock ;;
   workflows) resolve_volume; sync_workflows ;;
-  prune) resolve_volume; do_prune ;;
+  prune) resolve_volume; acquire_run_lock; do_prune ;;
   verify) resolve_volume; do_verify ;;
   download)
     resolve_volume

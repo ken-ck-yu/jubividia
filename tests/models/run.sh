@@ -82,7 +82,8 @@ LOCK=$REAL_LOCK
 check "real lock: default total is 41,427,929,848 bytes" \
   test "$(awk '!/^#/&&NF&&$4=="default"{s+=$2}END{print s}' "$REAL_LOCK")" = 41427929848
 check "real lock: pinned commit in header" has "$REAL_LOCK" '^# rev=49b093a39c19169a8a81721dcc541e07e945232f$'
-check "real lock: hashes all pending" test "$(awk '!/^#/&&NF&&$1!="null"' "$REAL_LOCK" | wc -l)" = 0
+check "real lock: no null hashes, all 64 hex" \
+  test "$(awk '!/^#/&&NF&&$1!~/^[0-9a-f]{64}$/' "$REAL_LOCK" | wc -l)" = 0
 expected="diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors 21504034224
 text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors 15372969374
 vae/ltx-2.5-video-vae-bf16.safetensors 1472223346
@@ -98,11 +99,11 @@ check "--list prints category, filename, path, set (tab separated)" \
   test "$(LOCK_FILE=$REAL_LOCK "$SCRIPT" --list | head -n1 | awk -F'\t' '{print NF" "$1" "$4}')" = "4 diffusion_models default"
 
 new_vol
-LOCK=$REAL_LOCK run
+LOCK=$T/lock.null run
 check "refuses download while hashes pending, points to --update-lock" \
   bash -c "test $RC -ne 0 && grep -q -- '--update-lock' '$T/out'"
 check "pending refusal made no HTTP request and wrote nothing" test ! -e "$VOL/models"
-LOCK=$REAL_LOCK run --verify
+LOCK=$T/lock.null run --verify
 check "--verify also refuses while pending" test "$RC" -ne 0
 
 # ================================================================ download
@@ -212,6 +213,41 @@ new_vol
 HF_TOKEN=$TOKEN LOCK_FILE=$LOCK SKIP_MOUNT_CHECK=1 CURL_RETRY_DELAY=1 bash -x "$SCRIPT" --volume-root "$VOL" >"$T/out" 2>&1
 check "bash -x run succeeds" test "$?" = 0
 check "bash -x trace never contains the token" hasnt "$T/out" "$TOKEN"
+
+check "volume df -hT is printed before downloading" has "$T/out" "Filesystem"
+check "category dirs of all lock entries are created (also optional, e.g. loras/)" test -d "$VOL/models/c"
+check "prune keeps .run.lock" bash -c "LOCK_FILE='$LOCK' SKIP_MOUNT_CHECK=1 '$SCRIPT' --prune --volume-root '$VOL' >/dev/null 2>&1; test -e '$VOL/models/.run.lock'"
+
+# bad token shapes: rejected with a clear message, never echoed
+new_vol
+for bad in $'tok\n' "tok en" $'tok\t'; do
+  HF_TOKEN="${bad}${TOKEN}" LOCK_FILE=$LOCK SKIP_MOUNT_CHECK=1 "$SCRIPT" --volume-root "$VOL" >"$T/out" 2>&1
+  check "token with whitespace/newline rejected (no echo)" \
+    bash -c "test $? -ne 0 && grep -q 'whitespace' '$T/out' && ! grep -q 'TESTTOKEN' '$T/out'"
+done
+
+# JOBS validation
+for j in 0 -1 abc 1.5; do
+  JOBS=$j HF_TOKEN=$TOKEN LOCK_FILE=$LOCK SKIP_MOUNT_CHECK=1 "$SCRIPT" --volume-root "$VOL" >"$T/out" 2>&1
+  check "JOBS=$j rejected" bash -c "test $? -ne 0 && grep -q 'JOBS must be' '$T/out'"
+done
+
+# concurrent run
+new_vol
+mkdir -p "$VOL/models"
+flock "$VOL/models/.run.lock" sleep 20 &
+LOCKER=$!
+sleep 0.5
+run
+check "concurrent run fails cleanly with a readable message" \
+  bash -c "test $RC -ne 0 && grep -q 'another download-models run' '$T/out'"
+run --prune
+check "concurrent prune is refused too" bash -c "test $RC -ne 0 && grep -q 'another download-models run' '$T/out'"
+pkill -P "$LOCKER" 2>/dev/null
+kill "$LOCKER" 2>/dev/null
+wait "$LOCKER" 2>/dev/null
+run
+check "run succeeds once the lock is released" test "$RC" = 0
 
 # mountpoint guard (no SKIP_MOUNT_CHECK)
 new_vol
