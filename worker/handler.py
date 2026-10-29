@@ -16,7 +16,9 @@ Input (job["input"]):
     seed        int >= 0                                     default random
 Output (success):
     {v, key, thumb_key, meta_key, duration_s, gen_time_s, seed,
-     width, height, num_frames, fps, cold}
+     width, height, num_frames, fps, cold, peak_vram_mb}
+    peak_vram_mb: max nvidia-smi memory.used (MiB) sampled during generation, or
+    null if nvidia-smi is unavailable. Also stored in the sidecar JSON.
 Output (failure): {"error": str, "error_code": code}  (RunPod marks FAILED)
     codes: bad_input config_error input_fetch workflow_mismatch model_missing
            oom timeout comfy_unavailable comfy_bad_response comfy_error
@@ -55,11 +57,24 @@ COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_ROOT = os.environ.get("COMFY_ROOT", "/comfyui")
 COMFY_PID_FILE = os.environ.get("COMFY_PID_FILE", "/tmp/comfyui.pid")
 WORKFLOWS_DIR = os.environ.get("WORKFLOWS_DIR", "/runpod-volume/workflows")
-# Must stay well below the platform execution timeout (900 s) so the caller gets
-# a readable error instead of a killed job; the remainder is reserved for uploads.
-# Generation budget; the rest of the platform limit is reserved for uploads.
+# Must stay well below the endpoint execution timeout so the caller gets a
+# readable error instead of a killed job; the remainder is reserved for uploads.
+# Generation budget; the rest of the execution timeout is reserved for uploads.
 JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "780"))
-PLATFORM_LIMIT_S = 900  # endpoint execution timeout (infra feature)
+# The endpoint's execution timeout in seconds. NOT a RunPod platform limit (RunPod
+# allows 5 s to 7 days): 900 s is our own spend-safety choice, set on the endpoint as
+# RUNPOD_EXEC_TIMEOUT_MS (infra/runpod/apply.sh), which also passes EXEC_TIMEOUT_S
+# (= that value / 1000) to the worker so the two cannot drift apart. The default must
+# equal RUNPOD_EXEC_TIMEOUT_MS / 1000 in config.env.example.
+PLATFORM_LIMIT_S = int(os.environ.get("EXEC_TIMEOUT_S", "900"))
+VRAM_SAMPLE_MIN_S = 0.2  # a smaller interval would fork nvidia-smi in a tight loop
+
+
+def clamp_sample_interval(v):
+    return max(VRAM_SAMPLE_MIN_S, float(v))
+
+
+VRAM_SAMPLE_S = clamp_sample_interval(os.environ.get("VRAM_SAMPLE_S", "1.0"))
 SAFETY_S = 15  # everything (incl. uploads/cleanup) must finish this early
 ATTEMPT_MAX_S = 45  # hard cap for one upload attempt, enforced by a thread join
 COMFY_READY_TIMEOUT_S = int(os.environ.get("COMFY_READY_TIMEOUT_S", "300"))
@@ -295,7 +310,7 @@ def upload_retry(fn, hard_deadline):
     for attempt in range(UPLOAD_TRIES):
         remaining = hard_deadline - time.time()  # checked before EACH try
         if remaining < 1:
-            last = last or "no time left before the platform limit"
+            last = last or "no time left before the execution timeout"
             break
         try:
             return run_bounded(fn, min(remaining, ATTEMPT_MAX_S))
@@ -326,6 +341,57 @@ def comfy_alive():
     except OSError:
         return True
     return True
+
+
+def read_vram_mb():
+    """Current memory.used (MiB) of the busiest GPU, or None if nvidia-smi is unusable."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+        vals = [int(x) for x in r.stdout.split() if x.strip().isdigit()]
+        return max(vals) if vals else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+class VramSampler:
+    """Samples GPU memory.used in a daemon thread; .peak_mb is the maximum seen.
+
+    Tolerant: if nvidia-smi is absent or fails on the first sample the thread
+    exits and peak_mb stays None. Includes PyTorch's allocator reserve, so it
+    approaches the card size even when the model would fit (report-only number).
+    """
+
+    def __init__(self, interval=None):
+        self.interval = VRAM_SAMPLE_S if interval is None else interval
+        self.peak_mb = None
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _sample(self):
+        v = read_vram_mb()
+        if v is not None and (self.peak_mb is None or v > self.peak_mb):
+            self.peak_mb = v
+        return v
+
+    def _run(self):
+        if self._sample() is None:
+            return
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def start(self):
+        self._t.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        self._t.join(10)
+        return self.peak_mb
 
 
 def require_comfy_alive():
@@ -584,10 +650,14 @@ def run_job(job):
         wait_for_comfy(deadline)
         require_comfy_alive()
         gen_start = time.time()
-        prompt_id = submit(wf)
-        cold = _first_job  # only a job that reached ComfyUI consumes the cold flag
-        _first_job = False
-        entry = wait_for_result(prompt_id, deadline)
+        sampler = VramSampler().start()
+        try:
+            prompt_id = submit(wf)
+            cold = _first_job  # only a job that reached ComfyUI consumes the cold flag
+            _first_job = False
+            entry = wait_for_result(prompt_id, deadline)
+        finally:
+            peak_vram_mb = sampler.stop()
         gen_time = round(time.time() - gen_start, 2)
 
         mp4 = find_output_mp4(entry, wf)
@@ -600,7 +670,7 @@ def run_job(job):
             "mode": p["mode"], "prompt": p["prompt"], "negative": p["negative"],
             "input_key": p["input_key"], "seed": p["seed"], "width": p["width"],
             "height": p["height"], "num_frames": p["num_frames"], "fps": p["fps"],
-            "gen_time_s": gen_time, "cold": cold,
+            "gen_time_s": gen_time, "cold": cold, "peak_vram_mb": peak_vram_mb,
         }
         upload_results(s3, stem, mp4, jpg, meta, t0 + PLATFORM_LIMIT_S - SAFETY_S)
 
@@ -610,6 +680,7 @@ def run_job(job):
             "duration_s": round(p["num_frames"] / p["fps"], 3), "gen_time_s": gen_time,
             "seed": p["seed"], "width": p["width"], "height": p["height"],
             "num_frames": p["num_frames"], "fps": p["fps"], "cold": cold,
+            "peak_vram_mb": peak_vram_mb,
         }
     finally:
         for f in created:
