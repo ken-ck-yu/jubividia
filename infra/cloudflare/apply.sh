@@ -13,6 +13,7 @@
 # See README.md ("UI") and docs/decisions/ui.md. --dry-run makes no Cloudflare write.
 # shellcheck disable=SC2015  # "A && B || die ..." is deliberate validation: die exits
 set -euo pipefail
+# shellcheck disable=SC2034  # read by die() in lib.sh
 TOOL_NAME=cloudflare-apply
 # shellcheck source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

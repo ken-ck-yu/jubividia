@@ -2,7 +2,7 @@
 # Offline tests for infra/cloudflare/apply.sh against a fake Cloudflare API (and a fake workers.dev front)
 # on 127.0.0.1. No Cloudflare, RunPod or other network access.
 #   bash tests/cloudflare/run.sh      (or: make -f infra/cloudflare/cf.mk test-cloudflare)
-# shellcheck disable=SC2016,SC2034
+# shellcheck disable=SC2016,SC2034,SC2126  # SC2016/SC2034: literal $ in grep patterns and sentinel vars; SC2126: grep -c would print one count per file, wc -l totals several files
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
@@ -102,6 +102,10 @@ for base in https://api.cloudflare.com/client/v4 http://127.0.0.1:80@evil.invali
   t "test mode refuses $base" 4 "$rc"
   tc "refusal text" "$out" "TEST MODE refuses non-loopback"
 done
+out=$(CF_TEST_MODE=2 CONFIG_ENV="$T/config.env" bash "$APPLY" preflight 2>&1); t "CF_TEST_MODE other than 0/1 is an error" 2 $?
+out=$(CF_TEST_MODE=yes CONFIG_ENV="$T/config.env" bash "$APPLY" preflight 2>&1); t "CF_TEST_MODE=yes is an error" 2 $?
+t "API base override ignored outside test mode" "https://api.cloudflare.com/client/v4" "$(CF_TEST_MODE=0 CLOUDFLARE_API_BASE=http://127.0.0.1:1/x bash -c ". '$LIB'; printf %s \"\$API_BASE\"")"
+t "API base override honoured in test mode" "http://127.0.0.1:1/x" "$(CF_TEST_MODE=1 CLOUDFLARE_API_BASE=http://127.0.0.1:1/x bash -c ". '$LIB'; printf %s \"\$API_BASE\"")"
 out=$(env -u CLOUDFLARE_API_BASE CF_TEST_MODE=1 CONFIG_ENV="$T/config.env" bash "$APPLY" preflight 2>&1); t "default real base refused in test mode" 4 $?
 out=$(CF_TEST_MODE=1 CLOUDFLARE_API_BASE=http://127.0.0.1:$PORT/client/v4 CONFIG_ENV="$T/config.env" bash -x "$APPLY" preflight 2>&1); t "bash -x refused" 2 $?
 tc "bash -x message" "$out" "refusing to run"

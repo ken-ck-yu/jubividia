@@ -33,10 +33,19 @@ BUCKET_NAME=jubividia-ltx-eu
 OTHER_WORKER_BASELINE=jubilab-website   # read-only: its modified_on is recorded and re-checked
 SECRET_NAMES=(RUNPOD_API_KEY RUNPOD_ENDPOINT_ID ALLOWED_EMAILS TEAM_DOMAIN POLICY_AUD)
 
-API_BASE=${CLOUDFLARE_API_BASE:-https://api.cloudflare.com/client/v4}
 # Test mode (set by tests/cloudflare/run.sh): every URL this code requests must be on 127.0.0.1,
 # so a test can never reach a real host. Checked again right before each curl.
+# Fail safe: only 0 or 1 are accepted, and the API base can be overridden ONLY in test mode.
 CF_TEST_MODE=${CF_TEST_MODE:-0}
+if [[ $CF_TEST_MODE != 0 && $CF_TEST_MODE != 1 ]]; then
+  echo "${TOOL_NAME:-apply}: CF_TEST_MODE must be 0 or 1" >&2
+  exit 2
+fi
+if [[ $CF_TEST_MODE == 1 ]]; then
+  API_BASE=${CLOUDFLARE_API_BASE:-https://api.cloudflare.com/client/v4}
+else
+  API_BASE=https://api.cloudflare.com/client/v4
+fi
 LOOPBACK_RE='^http://127\.0\.0\.1:[0-9]{1,5}(/[A-Za-z0-9._~/%:+=,-]*)?(\?[A-Za-z0-9._~/%:+=,&-]*)?$'
 CURL_NOPROXY=()
 if [[ $CF_TEST_MODE == 1 ]]; then CURL_NOPROXY=(--noproxy '*'); fi
