@@ -244,3 +244,85 @@ Secret substitution at boot; the live GET shape of an endpoint (`disk`, `image`,
 3. Should the run URL taken from `requestUrls` be pinned to a RunPod host (N3)?
 4. Should `status` abort on a second page like the other commands (N5)?
 5. Should the stop message report the failing poll's HTTP status rather than the cancel's (N2)?
+
+---
+
+# Gate guards and df fix
+
+Branch `fix/gate-hang-and-df` (tracks origin/main; nothing pushed by me): 6f1bad6 (my earlier re-check), 2c68f55, 28eb37e, ffde308. `git diff origin/main --stat` touches README, `docs/validation/endpoint.md`, `apply.sh`, `lib.sh`, `download-models.sh`, `smoke-job.sh`, `tests/infra/*`, `tests/models/run.sh`. **Nothing under `worker/` changed.** No RunPod or Cloudflare call; fake server and my mock servers on 127.0.0.1 only; `config.env` not read. Harnesses (`brk8-10.sh`, `dfcheck.sh`, `urlcheck3.sh`, `mock3.py`) are in the job scratch dir, not committed.
+
+## Verdict: ACCEPT
+
+All of N1 to N5 are fixed and I could not make the gate hang, bypass the spend cap, or fool the df parser. Remaining items are low and listed below.
+
+## Test runs
+
+| Command | Result |
+|---|---|
+| `make -f infra/runpod/infra.mk test-infra` | 371 passed, 0 failed |
+| same with shellcheck 0.11 on PATH (scratch venv) | 372 passed, 0 failed |
+| `make -f scripts/models.mk test-models` | 96 passed, 0 failed |
+| `make test` | 123 passed |
+| `make lint` | clean |
+| `shellcheck -x -e SC1091` on `apply.sh lib.sh smoke-job.sh tests/infra/run.sh download-models.sh tests/models/run.sh validate-workflows.sh wf-in-container.sh` | no findings |
+
+## N1 to N5 against real behaviour
+
+| Item | Result | Evidence |
+|---|---|---|
+| N1 `/status` IN_QUEUE forever, `/health` failing | **fixed** | `/health` 500, HTTP 200 with HTML, HTTP 200 with `{}` (no `workers`), and a hanging `/health` (curl max-time 1 s, status 000): each exits 3 after 5 health failures (1-8 s) with a cancel sent. A cancel that itself returns 500 changes nothing (exit 3). `/status` hanging: exit 3 after 5 failed polls. A queued job with an idle worker visible and a 3 s `SMOKE_JOB_WALL_S`: wall-clock cap fires, cancel sent, exit 3, also with a failing cancel. Default wall cap is execution timeout + 600 s = 1500 s per job. Every request goes through `http()` with `--max-time` (default 60 s); there is no other `curl` in the script, so no unbounded network call. |
+| N1 residual | low | A hanging `POST /run` ends in `die` (exit 1) after the 60 s timeout; the job may already exist on the endpoint but its id is unknown, so no cancel is possible. The coordinator must look at `/health` and the queue after any such exit. The R2 check (`aws s3`) has no script-level timeout, but it runs after a job completed. |
+| N2 stop message status | **fixed** | The failing poll's code is captured before the cancel runs (`last HTTP 500` / `000` in the runs above). |
+| N3 requestUrls pin | **fixed** | `^https://([A-Za-z0-9-]+\.)*runpod\.(ai\|io)(:port)?(/path)?/run$` (loopback allowed only in test mode); a non-matching value exits 4 before any job. Accepted: `api.runpod.ai`, `api.runpod.io`, `runpod.ai`, a port, a punycode subdomain. Refused: `evil-runpod.ai`, `runpod.ai.evil.com`, userinfo either way, host in path, `#@`, `?` before `/run`, trailing dot, uppercase host, `HTTPS`, `http`, Cyrillic homoglyph, backslash, other TLD `.net`, oversized port, embedded newline, space, IPv6. `/v2/../../x/run` is accepted but stays on the pinned host. curl does not follow redirects and (in test mode) uses `--noproxy '*'`. |
+| N4 spend estimate, `--max-spend` 3.00 | **fixed, conservative enough** | Each finished job adds 60 s idle tail plus one poll interval; a full fake gate reported $0.176 (cap 3.00). With `--max-spend 0.05` it stopped at the second job ($0.0586) because of the tails; a stuck IN_PROGRESS job stopped at $0.0200 (cap 0.02) with a cancel. An unhealthy worker stops on the unhealthy check; queued-forever with `/health` failing stops on the health limit. A worker visible in `/health` counts as billing, so a stuck worker cannot hide; the only unmetered gap is when neither endpoint can be read, and that is now bounded by the 5-failure limits and the wall cap. The worst-case wall cap per job (1500 s, about $0.73) is below the cap, so a runaway single job is bounded by the wall cap before spend matters. |
+| N5 `status` pagination | **fixed** | With a second page of pods `apply.sh status` prints `rpjson: list has more than one page; refusing to guess` and exits 1. Normal run unchanged. |
+
+## df free-space guard (`scripts/download-models.sh`)
+
+Flags actually used: `df -PkT "$VOLUME_ROOT"` for the guard (POSIX, 1K blocks, integer KiB, no wrapping, type column), and `df -hT` for the human printout only. Only line 2 is read; the first five whitespace-separated fields are taken, so a mount point with spaces or tabs cannot affect the numbers. I ran the extracted function against a stub `df`:
+
+| Input | Result |
+|---|---|
+| The real RunPod line in KiB (`mfs#us-wa-1.runpod.net:9421 fuse` 615T total, 249T free) | accepted; free = 273,778,395,316,224 bytes; the shared-filesystem note is printed |
+| The same line in human-readable form (`615T 366T 249T`) | refused with "could not parse the free space" |
+| Scientific notation (`1e+15`, `2.7e+14`) | refused, never evaluated |
+| Mount point with spaces or a tab | numbers still read correctly |
+| Filesystem name containing a space (columns shift) | refused loudly |
+| Missing column, missing type, empty output, header only, garbage, three-line wrapped output, CR-terminated line, negative number | all refused loudly |
+| Type outside the network list (`ext4`, `weird`) | no note, free space still checked |
+| `fuse.mfs`, `fuse.sshfs`, `nfs4` | in the network list or accepted |
+| Exactly 4 TiB (4,294,967,296 KiB) | no note; 4 TiB + 1 KiB: note |
+| Genuinely low free space on a 615T FUSE (1,000 KiB avail) | returns 1,024,000 bytes; the caller then refuses ("not enough free space") and no download starts (also covered by the suite, 96 passed) |
+| Locale `de_DE` | no effect (integers only, the locale was not installed here so this only shows no crash) |
+
+Two inputs behave oddly but df never produces them: leading zeros (`0100`) are read as octal by bash arithmetic, and `08` aborts with an arithmetic error (loud); 20-digit numbers wrap on 64-bit arithmetic. Neither is a concern.
+
+Limit by design: on RunPod the guard sees the shared cluster's free space, not the 80 GB quota, so it cannot detect that the quota is exhausted; it refuses only when `df` itself reports too little. The README says this.
+
+## README and numbers
+
+- Measured table: 41,427,929,848 bytes equals the lock total (the suite checks it); 3 min 39 s is 13:03:44 to 13:07:23 UTC; the verify window 13:07:23 to 13:09:44 is 2 min 21 s; 41.43 GB / 219 s is about 189 MB/s. The lock lists 8 default files (the 9th, the LoRA, is optional): consistent.
+- Stale text: the step-4 paragraph still says "Expect roughly 3-7 minutes for 41 GB plus a few minutes of hashing (unmeasured)", which the Measured table now contradicts. Cosmetic.
+- Gate paragraph matches the code: `--max-spend` default 3.00, 60 s idle tail plus one poll per job, host pin, `SMOKE_JOB_WALL_S`, `SMOKE_HEALTH_FAIL_LIMIT`.
+- Delete paths unchanged (`api_delete pod|secret_hf|endpoint` only), `--dry-run` still writes nothing (suite), no secrets in the tree (grep for `rpa_`, `hf_...`, `AKIA` empty; the added diff lines contain none).
+
+## Numbered questions
+
+1. A hanging or failing `POST /run` leaves a possibly-queued job with no id and no cancel. Accept the manual check of `/health` and the console, or should the script query the queue and purge on that error?
+2. The df guard cannot enforce the 80 GB quota on the shared FUSE filesystem. Is a post-download `du` of the volume tree against 80 GB worth adding, or is the verify table enough?
+3. Please correct the stale "(unmeasured)" sentence in the README.
+
+## What must be true before the coordinator runs the real gate
+
+1. `IMAGE_TAG` is a `sha-<7+ hex>` from the CI build of a commit that contains the worker changes (`peak_vram_mb`, `EXEC_TIMEOUT_S`, VRAM clamp); not `latest`, not the old `sha-f637c09`. Confirm the build run and that the GHCR package is public (`preflight`).
+2. The endpoint exists via `apply.sh endpoint --max-workers 1`; right after creation read `GET /serverless/{id}` once: `timeout` 900000, `flashboot` FLASHBOOT, `gpu` pools and exclusions, the volume mount, `workers` max 1, and `requestUrls.run` on `*.runpod.ai` or `*.runpod.io` (otherwise the script exits 4 by design).
+3. The volume is populated and `download-models.sh --verify` passed; the temp pod is gone (`GET /pods` empty) and `hf_token_tmp` is deleted; the HF token has been rotated.
+4. Both R2 secrets exist and the R2 token is scoped to the bucket with Object Read and Write. The canary is the only test that the `{{ RUNPOD_SECRET_... }}` substitution works.
+5. Balance and payment method confirmed in the console; RTX 6000 Ada serverless stock at US-WA-1 re-read immediately before the gate.
+6. `/health` shows 0 workers and nothing queued before the first job. Ken has chosen `--max-spend` (default 3.00) and agrees the per-job wall cap.
+7. Someone watches the console Workers page during the run; after any exit 3 or exit 1 read `/health`, cancel the job by hand if the script could not, and confirm the worker scales to zero.
+8. `aws` and `ffprobe` are available on the machine running the gate, or `--no-r2-check` is used knowingly (then audio and R2 objects are unverified).
+
+## What still cannot be verified without real calls
+
+Secret substitution at boot; the live endpoint GET shape and `requestUrls`; the real `/health`, `/status` and `/cancel` field names and whether `error_code` appears; GPU pool and type ids; the `cpu3c` id and stock; that the quota behaves as 80 GB on the shared filesystem; real FlashBoot, scaling and billing granularity (the spend figure is an estimate, not a billing read).
