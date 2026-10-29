@@ -65,7 +65,8 @@ Node ids (two-stage): t2v 1-5 loaders, 6-10 WIDTH/HEIGHT/FRAMES/FPS/SEED, 11 PRO
   sidecar reports.
 * v2v `INPUT` field is `file`: the handler already does this (`INPUT_FIELDS["v2v"]`).
 * Defaults: 1280x704 (720 is not a multiple of 32 or 64), 24 fps, 121 frames (~5.04 s).
-* Frame count must be 8k+1 (handler already enforces it).
+* Frame count must be 8k+1 (handler already enforces it). For v2v it must also be >= 33
+  (handler change pending, see V2V below).
 * Size limits: the handler allows up to 2048x2048 and 481 frames. That maximum is **untested**
   (`scripts/validate-workflows.sh` only proves `/prompt` accepts it, not that 48 GB can run
   it). Recommend the UI caps resolution (for example 1280x704 and 1536x864-class presets) and length
@@ -76,29 +77,56 @@ Node ids (two-stage): t2v 1-5 loaders, 6-10 WIDTH/HEIGHT/FRAMES/FPS/SEED, 11 PRO
 `v2v` extends your clip; it does not edit it.
 
 * The **last K = 25 frames** of the input (about 1 s at 24 fps) are used as a guide at
-  `frame_idx 0` of the new clip (`LTXVAddGuide`, strength 1.0). The generated clip therefore
-  starts from where the input ends and then follows the prompt.
+  `frame_idx 0` of the new clip (`LTXVAddGuide`, strength `GUIDE_STRENGTH`, 1.0). That
+  conditions the **first ~K frames of the new clip** (about 1 s) to resemble the last K frames of
+  the input. **The output does not start after the input; the new segment overlaps the last
+  ~1 s of the source** and then follows the prompt from there.
 * **Output is the new segment only** (`FRAMES` frames). The source is not included. The guide
   frames are cropped (`LTXVCropGuides`) before the stage-1 latent is upscaled and again before
   decoding, and are re-added at full size for stage 2, as the I2V graph does with the image.
+* **Joining clips:** a UI or script that concatenates source and result should drop the first
+  K/fps seconds (the first K = 25 frames, about 1.04 s at 24 fps) of the new segment, or the
+  last K/fps seconds of the source, to avoid a duplicated second.
 * **Audio is newly generated** from the prompt; voice, music and ambience do not continue
-  from the input. The input's audio is ignored.
+  the source's sound (there is a seam when joined). The input's audio is ignored.
+* **Not verified here:** this overlap behaviour and the visual continuity are read from the
+  `LTXVAddGuide` source, not observed. Confirm on the first real GPU run.
 * **K must be 8n+1** (25 or 49; anything else is cut down to the nearest 8n+1). Change it
   by editing `GUIDE_K` in `scripts/build-workflows.py` (and `GUIDE_WINDOW_S`, the number of
   trailing seconds decoded, which must cover K frames at the source frame rate; 4 s covers K=49
   down to 13 fps) and re-running the build. Larger K costs more VAE-encode time and attention
   tokens; keep it at 25 or 49.
-* **FRAMES must be larger than K** (the guide has to fit inside the latent). The handler's
-  minimum of 9 frames therefore fails at run time for v2v with K=25: the UI should require at
-  least 33 frames for v2v. `/prompt` cannot catch this (the value is only checked when the
-  node runs).
-* Inputs shorter than K frames use all frames available (rounded down to 8n+1).
-* Only the last `GUIDE_WINDOW_S` seconds of the input are decoded (`Video Slice`, negative
-  start time counts from the end), so memory does not grow with the input length.
+* **v2v needs FRAMES >= 33.** The guide has to fit inside the latent, and the handler's
+  minimum of 9 frames fails at run time with K=25 (`/prompt` cannot catch it; the value is only
+  checked when the node runs). The UI must offer at least 33 frames for v2v, and the handler is
+  to reject v2v with fewer than 33 frames (handler change, not in this branch).
+* Inputs with fewer than K frames use what exists (a 12-frame clip gives a 12-frame guide, which
+  `LTXVAddGuide` cuts to 8n+1 = 9; executed in `validate-workflows`).
+* Only the last `GUIDE_WINDOW_S` (4 s) of the input are decoded (`Video Slice`, negative start
+  time counts from the end), so memory does not grow with the input length. The last K frames
+  are then taken by count (`ImageFromBatch`, index -K). A source below about 6 fps has fewer than
+  25 frames in that 4 s window, so fewer guide frames are used. Selecting by count without
+  decoding the whole file is not possible with core nodes, so the window stays.
 * Frames are scaled to `WIDTH`x`HEIGHT` with a centre crop (aspect ratio is preserved, edges cut).
 
-UI wording suggestion: "Continue this clip: new video that picks up from the last second
-of yours, with new sound. Your original is not included."
+UI wording suggestion: "Continue this clip: a new video that starts from the last second
+of yours (it repeats that second) and goes on from there, with new sound. Your original is
+not included."
+
+### Tuning knobs (V2V), first to try
+
+1. `GUIDE_STRENGTH` in `scripts/build-workflows.py` (1.0). The Comfy-Org flf2v template uses
+   0.7; lower values let the model move away from the source tail sooner.
+2. `GUIDE_K` (25; 8n+1, e.g. 49) and `GUIDE_WINDOW_S` (4 s).
+
+## Release checklist
+
+1. Bump `WORKFLOW_VERSION` in `scripts/build-workflows.py` (this is the output prefix `_wfN`) and
+   the `Workflow version:` line above, together; run `make -f scripts/workflows.mk build-workflows`.
+2. Run `make -f scripts/workflows.mk test-workflows` and `validate-workflows` (all must pass).
+3. Ship the handler change (64-rounding, v2v minimum 33 frames) and the workflow files in the same
+   release; rebuild the worker image if the handler changed.
+4. Sync the workflows to the volume: `scripts/download-models.sh --workflows-only`.
 
 ## Models
 
@@ -140,6 +168,9 @@ types, combo values), fills each with the handler's own `fill_workflow` for four
 sets (default, custom negative, minimum size, 2048x2048x481), and requires `POST /prompt` to return
 HTTP 200 with empty `node_errors`. It also really executes the v2v input chain
 (trim, decode, last K frames, resize) on CPU and requires exactly K frames.
+The static checks also pin the loader and sampler literals (CLIPLoader `type` ltxv, UNETLoader
+`weight_dtype` default, `euler_ancestral`, the sigma strings, CFG 1/1) and every link's output
+slot, and run built-in negative controls (for example CLIPLoader `type: wan` must fail).
 `HANDLER=` and `LOCK=` select `handler.py` and `models.lock` when they are not in this checkout.
 
 Not provable without a GPU and the real models: image/video quality, VRAM and speed
