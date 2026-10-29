@@ -35,6 +35,8 @@ const S = {
   poll: { timer: null, fails: 0, firstFailAt: 0 },
   tick: null,
   galleryNext: null,
+  shownKey: null, // clip key in the result player
+  pendingDelete: null,
 };
 
 // ------------------------------------------------------------------ small helpers
@@ -74,6 +76,56 @@ function recall(key) {
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const fmtMB = (n) => `${(n / MB).toFixed(n >= 10 * MB ? 0 : 1)} MB`;
 const localTime = (iso) => new Date(iso).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+
+// ------------------------------------------------------------------ prompt guide
+const EXAMPLES = {
+  t2v: [
+    "A red fox trots through fresh snow at sunrise, breath steaming in the cold air. The camera tracks slowly alongside at ground level. Soft golden light through bare trees. Quiet crunching footsteps in snow and distant birdsong.",
+    "Rain falls on a quiet city street at night, neon signs reflecting in the puddles. A man in a yellow raincoat walks toward the camera under an umbrella, slow handheld shot. The patter of rain, a distant siren, and his footsteps splashing.",
+    "A cozy kitchen at dawn. A kettle comes to a boil on the stove and steam curls upward. Static camera, warm window light. The kettle whistles softly, with a clock ticking in the background.",
+  ],
+  i2v: [
+    "The cat blinks slowly, then stretches and yawns, tail flicking. The camera pushes in gently. Calm, warm room light. Soft purring and a faint rustle of fabric.",
+  ],
+  v2v: [
+    "The dog keeps running across the field, then slows and turns toward the camera, tail wagging. Same bright sunny light. Panting and grass rustling.",
+  ],
+};
+const MODE_TITLE = { t2v: "Text examples", i2v: "Image examples", v2v: "Video continue examples" };
+const GUIDE_SEEN_KEY = "jubividia.guide-seen";
+
+function renderExamples() {
+  const box = $("guide-examples");
+  box.replaceChildren();
+  const order = [S.mode, ...["t2v", "i2v", "v2v"].filter((m) => m !== S.mode)]; // current mode first
+  for (const mode of order) {
+    box.append(el("div", { class: "example-group", text: MODE_TITLE[mode] + (mode === S.mode ? " (current mode)" : "") }));
+    for (const text of EXAMPLES[mode]) {
+      const use = el("button", { type: "button", class: "small", text: "Use this prompt" });
+      use.addEventListener("click", () => useExample(mode, text));
+      box.append(el("div", { class: "example" }, el("p", { text }), use));
+    }
+  }
+}
+
+function useExample(mode, text) {
+  if (mode !== S.mode) {
+    document.querySelector(`input[name="mode"][value="${mode}"]`).checked = true;
+    setMode(mode);
+  }
+  $("prompt").value = text; // property assignment, never markup
+  updateForm();
+  $("prompt").focus();
+}
+
+function initGuide() {
+  renderExamples();
+  // First visit: open the guide once and remember it. Storage may be unavailable; then it just opens each time.
+  if (recall(GUIDE_SEEN_KEY) === null) {
+    $("prompt-guide").open = true;
+    store(GUIDE_SEEN_KEY, "1");
+  }
+}
 
 class SessionError extends Error {}
 
@@ -150,6 +202,7 @@ function setMode(mode) {
   $("file-label").textContent = mode === "i2v" ? "Choose a photo" : "Choose a video";
   clearFile();
   $("v2v-tip").hidden = true;
+  if ($("guide-examples")) renderExamples();
   updateForm();
 }
 
@@ -572,6 +625,7 @@ function mediaUrl(key, download) {
 }
 
 function showResult(o) {
+  S.shownKey = o.key;
   const v = $("player");
   v.poster = o.thumb_key ? mediaUrl(o.thumb_key) : "";
   v.src = mediaUrl(o.key);
@@ -626,10 +680,71 @@ function card(item) {
   const play = el("button", { type: "button", text: "Play" });
   const load = el("button", { type: "button", text: "Load" });
   const dl = el("a", { class: "button", href: mediaUrl(item.key, true), text: "Save" });
+  const rm = el("button", { type: "button", class: "danger", text: "Delete" });
+  rm.addEventListener("click", () => askDelete(item.key, () => cardEl));
   play.addEventListener("click", () => showResult({ ...m, key: item.key, thumb_key: item.thumb_key, est_usd: item.est_usd }));
   img.addEventListener("click", () => play.click());
   load.addEventListener("click", () => loadParams(item));
-  return el("div", { class: "item" }, img, meta, el("div", { class: "acts" }, play, load, dl));
+  const cardEl = el("div", { class: "item", "data-key": item.key }, img, meta, el("div", { class: "acts" }, play, load, dl, rm));
+  return cardEl;
+}
+
+// ------------------------------------------------------------------ delete
+function askDelete(key, getCard) {
+  S.pendingDelete = { key, getCard };
+  show($("confirm-error"), false);
+  $("confirm-ok").disabled = false;
+  const d = $("confirm-delete");
+  if (typeof d.showModal === "function") d.showModal();
+  else d.setAttribute("open", "");
+}
+
+function closeConfirm() {
+  const d = $("confirm-delete");
+  if (typeof d.close === "function") d.close();
+  else d.removeAttribute("open");
+  S.pendingDelete = null;
+}
+
+async function confirmDelete() {
+  const p = S.pendingDelete;
+  if (!p) return;
+  $("confirm-ok").disabled = true;
+  try {
+    const res = await fetch(`/api/outputs/${p.key}`, { method: "DELETE", headers: { "X-Jubividia": "1" }, credentials: "same-origin", redirect: "manual" });
+    if (res.type === "opaqueredirect" || res.redirected) throw new SessionError("redirect");
+    if (res.status !== 204) {
+      let msg = "Could not delete the clip. Try again.";
+      try {
+        msg = (await res.json()).message || msg;
+      } catch {
+        throw new SessionError("not-json");
+      }
+      setText("confirm-error", msg);
+      show($("confirm-error"), true);
+      $("confirm-ok").disabled = false;
+      return;
+    }
+  } catch (e) {
+    setText("confirm-error", e instanceof SessionError ? SESSION_MSG : "Could not delete the clip. Try again.");
+    show($("confirm-error"), true);
+    $("confirm-ok").disabled = false;
+    return;
+  }
+  const card = p.getCard && p.getCard();
+  if (card) card.remove();
+  else for (const c of document.querySelectorAll(".item")) if (c.dataset.key === p.key) c.remove();
+  if (S.shownKey === p.key) {
+    const v = $("player");
+    v.pause();
+    v.removeAttribute("src");
+    v.removeAttribute("poster");
+    v.load();
+    show($("result"), false);
+    S.shownKey = null;
+  }
+  show($("gallery-empty"), $("gallery").children.length === 0);
+  closeConfirm();
 }
 
 async function refreshGallery(reset) {
@@ -668,6 +783,14 @@ function initBrandImage() {
 
 function init() {
   initBrandImage();
+  $("confirm-cancel").addEventListener("click", closeConfirm);
+  $("confirm-ok").addEventListener("click", confirmDelete);
+  $("confirm-delete").addEventListener("cancel", () => {
+    S.pendingDelete = null;
+  });
+  $("delete-result").addEventListener("click", () => {
+    if (S.shownKey) askDelete(S.shownKey, null);
+  });
   for (const r of document.querySelectorAll('input[name="mode"]')) r.addEventListener("change", () => setMode(r.value));
   $("file").addEventListener("change", onFile);
   for (const id of ["prompt", "seed", "width", "height", "duration", "fps"]) $(id).addEventListener("input", updateForm);
@@ -692,6 +815,7 @@ function init() {
     }
   });
   setMode("t2v");
+  initGuide();
   const saved = recall("jubividia.job");
   if (saved && /^[A-Za-z0-9-]{8,64}$/.test(saved)) adoptJob(saved, null, null);
   refreshState();

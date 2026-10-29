@@ -279,6 +279,14 @@ Two people (Ken and a second person). Cloudflare Access (one-time PIN, 24 h sess
 
 All subcommands accept `--dry-run` (no Cloudflare write). `teardown` prints the undo steps. Offline tests: `bash tests/cloudflare/run.sh` (fake Cloudflare API on 127.0.0.1; test mode refuses any other host).
 
+### Deleting clips
+
+Every gallery card and the result card has a Delete button. It asks for confirmation in a dialog, then calls `DELETE /api/outputs/<key>`. The Worker accepts only keys of the exact form `outputs/<YYYY-MM-DD>/<YYYYMMDDTHHMMSS>-<jobid>.(mp4|jpg|json)` (job id `[A-Za-z0-9_-]`, at most 80 characters, timestamp date equal to the folder date); anything else, including everything under `inputs/` and `state/`, is a 400 and nothing is touched. It deletes the sidecar `.json` first (the gallery lists clips by sidecar, so the clip disappears at once), then the `.mp4` and `.jpg`. Repeating a delete returns 204; a partial failure returns a retryable 500. It needs the Access JWT and the `X-Jubividia` header like every other mutating route. **Known limitation:** the gallery is shared, so either allowed user can delete any clip, and a delete is permanent.
+
+### Prompt guide
+
+Under the prompt box a collapsible "Prompt guide for beginners" explains the five-part prompt structure (action, motion, who and where, camera and light, sound), rules of thumb for a 5 second clip, ready-made examples with a "Use this prompt" button (current mode first), and five reading links. It opens on a first visit only (remembered in `localStorage`, which may be unavailable; no cookies). The only external URLs the page may contain are those five links, enforced by `ui/scripts/static-rules.mjs` (run by `npm test`).
+
 ### Personalising the page
 
 The masthead shows the name "JubiVidia", a tagline and, optionally, a small round photo. The photo is **optional and never committed**: the repository is public, so `ui/static/brand.jpg` is in `.gitignore`, and `ui/scripts/check-static.mjs` (run by `npm test`) fails if any image file is tracked. Without the file (a fresh clone) the page simply shows the text brand.

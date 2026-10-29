@@ -3,6 +3,7 @@
 // mentions a secret name.
 import { readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { checkHtml } from "./static-rules.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,12 +59,7 @@ for (const f of staticFiles) {
   }
 }
 const html = read("static/index.html");
-if (/\son[a-z]+\s*=/i.test(html)) failures.push("index.html: inline event handler attribute");
-if (/\sstyle\s*=/i.test(html)) failures.push("index.html: inline style attribute");
-if (/<script(?![^>]*\ssrc=)[^>]*>/i.test(html)) failures.push("index.html: inline <script>");
-if (/<(script|link|img|video|iframe)[^>]+(src|href)\s*=\s*["']?(https?:)?\/\//i.test(html)) {
-  failures.push("index.html: external resource");
-}
+failures.push(...checkHtml(html)); // inline handlers/styles/scripts; only allowlisted external <a href> links
 if (/@import|url\(\s*["']?https?:/i.test(read("static/style.css"))) failures.push("style.css: external resource");
 if (/(?<![A-Za-z.])(?:https?:)?\/\/[a-z0-9.-]+\.[a-z]{2,}/i.test(read("static/app.js").replace(/\/\/ .*$/gm, "")) ) {
   failures.push("app.js: contains an absolute URL");

@@ -44,9 +44,49 @@
       <p id="file-info" class="muted"></p>
     </div>
 
+    <p id="prompt-nudge" class="nudge">New here? Open the prompt guide below: a good prompt matters more than any setting.</p>
     <label for="prompt" class="field-label">Prompt <span id="prompt-count" class="muted"></span></label>
     <textarea id="prompt" rows="4" maxlength="2000" placeholder="A fox trots through fresh snow at sunrise, soft footsteps and distant birdsong"></textarea>
     <p class="help">Sound is generated from the prompt too, so describe what it should sound like.</p>
+
+    <details id="prompt-guide" class="guide">
+      <summary>Prompt guide for beginners</summary>
+      <div class="guide-body">
+        <h3>Five parts, in this order</h3>
+        <ol>
+          <li><strong>Main action first.</strong> Say what happens, in one clear sentence.</li>
+          <li><strong>How it moves.</strong> Speed and direction: trots, drifts, spins slowly.</li>
+          <li><strong>Who and where.</strong> One subject, one place, a few details.</li>
+          <li><strong>Camera and light.</strong> Static, slow dolly in, handheld, low angle. Soft window light, golden hour.</li>
+          <li><strong>Sound.</strong> This model makes audio too. Name the ambient sounds and the key sounds; if you say nothing you get generic sound.</li>
+        </ol>
+        <p>Write plain sentences in the present tense, like describing a film shot. Not a list of tags.</p>
+
+        <h3>Rules of thumb for a 5 second clip</h3>
+        <ul>
+          <li>One subject and one main action.</li>
+          <li>Describe the motion, not just the looks.</li>
+          <li>Name the camera: static, slow dolly in, handheld, low angle.</li>
+          <li>Avoid readable text, logos and crowds.</li>
+          <li><strong>Image mode:</strong> describe what should happen, not what is already in the photo.</li>
+          <li><strong>Video continue mode:</strong> describe what happens next, in the same style. The new clip repeats the last second of yours.</li>
+          <li>Change one thing at a time and reuse the seed (Advanced) to compare.</li>
+          <li>Draft cheaply with the Fast 640x384 quick size, then use 1280x704 for the keeper.</li>
+        </ul>
+
+        <h3>Examples</h3>
+        <div id="guide-examples"></div>
+
+        <h3>More reading</h3>
+        <ul class="links">
+          <li><a href="https://ltx.io/blog/prompting-guide-for-ltx-2" target="_blank" rel="noopener noreferrer">The official LTX guide</a></li>
+          <li><a href="https://fal.ai/learn/tools/how-to-use-ltx-2-5" target="_blank" rel="noopener noreferrer">How to use LTX 2.5 (fal.ai)</a></li>
+          <li><a href="https://deapi.ai/blog/ltx-2-5-prompting-guide-multi-shot-scenes-native-audio-and-prompts-that-actually-cut" target="_blank" rel="noopener noreferrer">LTX 2.5 prompting guide: scenes and native audio (deAPI)</a></li>
+          <li><a href="https://ltxworkflow.com/resources/tutorials/ltx-23-prompting-guide" target="_blank" rel="noopener noreferrer">LTX prompting guide (ltxworkflow.com)</a></li>
+          <li><a href="https://docs.comfy.org/es/tutorials/video/ltx/ltx-2" target="_blank" rel="noopener noreferrer">LTX 2 in ComfyUI (docs)</a></li>
+        </ul>
+      </div>
+    </details>
 
     <details id="advanced">
       <summary>Advanced</summary>
@@ -112,6 +152,7 @@
     <div class="row">
       <a id="download" class="button small" href="#">Download</a>
       <button type="button" id="share" class="small" hidden>Share</button>
+      <button type="button" id="delete-result" class="small danger">Delete</button>
     </div>
     <p id="v2v-tip" class="help" hidden>To join the clips, skip the first second of this new clip: it repeats the end of your original.</p>
   </section>
@@ -122,6 +163,16 @@
     <p id="gallery-empty" class="muted" hidden>No clips yet.</p>
     <button type="button" id="load-more" class="small" hidden>Load more</button>
   </section>
+
+  <dialog id="confirm-delete" aria-labelledby="confirm-title">
+    <h2 id="confirm-title">Delete this clip?</h2>
+    <p>Delete this clip permanently? The video, thumbnail and details are removed for both users (shared gallery). This can't be undone.</p>
+    <p id="confirm-error" class="error" role="alert" hidden></p>
+    <div class="row">
+      <button type="button" id="confirm-cancel" class="small">Cancel</button>
+      <button type="button" id="confirm-ok" class="small danger">Delete</button>
+    </div>
+  </dialog>
 </main>
 </body>
 </html>
