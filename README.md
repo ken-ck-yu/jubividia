@@ -208,23 +208,40 @@ Every `aws` and `ffprobe` call has a ceiling (`SMOKE_TOOL_TIMEOUT_S`, default 30
 - **Idle auto-scale-down:** RunPod lowers an endpoint's max workers after 3 days without requests (to 2) and sets it to 0 after 7. Jobs then fail or queue (a 409 paused endpoint). `apply.sh status` warns when max workers differs from `RUNPOD_WORKERS_MAX`; **`apply.sh endpoint` restores it**.
 - Stale pod: `apply.sh status` warns if `jubividia-models-tmp` exists; `apply.sh pod-down` terminates it.
 
-### Measured (fill in after the gate)
+### Measured (second real gate run, 2026-10-29: PASSED)
+
+Endpoint on image `sha-f9bc90a`, RTX 6000 Ada, US-WA-1, workers max 1 for the gate.
 
 | Item | Value |
 |---|---|
-| Cold start, first ever / second (worker start + model-load overhead) | _to fill_ |
-| Warm default clip `gen_time_s` (1280x704x121) | _to fill_ |
-| Cold + default clip total (user path) | _to fill_ |
-| Peak VRAM (`peak_vram_mb`) | _to fill_ |
-| Cost per clip, measured | _to fill (SPEC §7's 3-minute example assumes cold+gen about 3 min)_ |
+| Cold start, tiny clip (worker start + model-load overhead) | worker start 3.9 s + overhead 103.9 s (cold gen 117.99 s - warm gen 14.07 s) = 107.8 s. The canary's own worker start was about 58 s |
+| Warm default clip `gen_time_s` (1280x704x121 @24 fps, 5.04 s) | 68.21 s (execution 70.9 s); the second warm run 66.40 s, 2.7% from the first |
+| Cold + default clip after scale-to-zero (the user path) | delay 98.1 s + execution 193.4 s (gen 186.84 s): cold start = worker start 104.6 s + model-load overhead 118.6 s = **223.2 s** (above the 180 s flag, below the 600 s hard stop); 291.5 s from submit to done |
+| Peak VRAM (`peak_vram_mb`, report-only) | tiny 39,409 / 39,889 MiB; default clip 43,473 MiB (42.5 GiB), second warm 41,521 MiB, cold 43,761 MiB. No OOM; the 46 GiB (47,104 MiB) line was never reached |
+| Repeat of an identical request | completes in 1.02 s gen with a new output key (the per-run OUTPUT prefix fix works on the real worker); mp4 48,866 bytes, sidecar has the same prompt and seed and a different job_id |
+| Audio and outputs | every completed job's mp4 has an AAC 48 kHz stereo track; the default clip is h264 1280x704, 121 frames, 24 fps, 5.04 s video, 5.01 s audio, 917,019 bytes; mp4, jpg and json reached R2 every time |
+| Offload | not checked (not detectable from job data, and the worker logs were gone) |
+| Cost per clip (estimate at $1.75/hr) | warm default clip about $0.034 (70.9 s); first clip after idle about $0.09 to $0.14, depending on whether the worker start is billed. The runner's own estimate for the whole second run was $0.62 |
+| Scale-down | the worker took about 6 minutes after its last job (finished 15:19:14; the runner saw 0 workers and submitted the cold job at about 15:25:19) to reach zero, although the idle timeout is 60 s |
 
-#### First real gate run (2026-10-29)
+Billing read back from RunPod for the first run: the 14:00-15:00 bucket totalled $0.104 for a worker that was alive about 8 minutes, and the first worker, which never ran a job, left no billing record. That suggests idle time is not charged, but it is inferred from one bucket (the 15:00 bucket had not posted yet): treat it as an observation, not a fact, and confirm on the next billing read.
+
+#### Cold-start mitigations (proposals only; SPEC says to ask Ken before changing the idle timeout)
+
+The first clip after idle takes about 3.7 to 4.9 minutes end to end (223 s cold start plus generation), well above SPEC §7's 3-minute example. Options, cheapest first:
+1. Accept it and make the UI show a "cold starting" state with the elapsed time.
+2. A longer idle timeout so a burst of use stays warm. This looks cheap if idle time really is unbilled (see above); confirm on the billing read before asking Ken.
+3. Only if measured to help: a faster volume tier (the model load from the network volume is about 104 to 119 s of the cold start).
+Nothing here is applied; `idleTimeout` stays 60 s.
+
+#### First real gate run (2026-10-29, image before the fixes below)
 
 - The canary passed: the R2 secrets resolve on the worker, and `/status` exposes `error_code`.
 - A cold 256x256x25 t2v job on the RTX 6000 Ada completed in 125 s total (`gen_time_s` 123 s, which includes about 100+ s of model loading from the network volume; ComfyUI logged `Prompt executed in 122.33 seconds`).
 - Peak VRAM was 39,473 MiB (report-only). The mp4 has an AAC 48 kHz stereo audio stream, and the three objects reached R2.
 - Three bugs found and fixed afterwards: (1) `smoke-job.sh` reported "audio stream: MISSING" on a clip that has audio, because `ffprobe | grep -q` under `set -o pipefail` dies of SIGPIPE (the offline stubs wrote instantly, so tests missed it); (2) an identical repeated request (same prompt, seed, size) was served entirely from ComfyUI's cache (`Prompt executed in 0.01 seconds`) and failed with `[output_missing] node OUTPUT produced no mp4`; the worker now makes the OUTPUT `filename_prefix` unique per run; (3) the cold-start number was wrong because the model load sits inside `gen_time_s` (see the definition above).
 - Two observations are unexplained: workers stayed IDLE/INITIALIZING well past the 60 s idle timeout, twice. The endpoint was parked by hand with max workers 0.
+- The second run (above, on `sha-f9bc90a`) passed with all three bugs fixed. The scale-down delay (about 6 minutes after the last job) was seen again, so it is now three observations of the same behaviour; the cause is still unknown. Next steps stay as in "Interpreting a run".
 
 ### Tests
 
