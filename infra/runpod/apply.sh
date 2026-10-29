@@ -423,9 +423,7 @@ cmd_status() {
     else say "   $id: HTTP $API_STATUS"; fi
   else say "   none recorded"; fi
   say "== temp pod"
-  api GET /pods
-  api_must "list pods"
-  k=$(printf '%s' "$API_BODY" | pyj ids "name=$POD_NAME" | grep -c .) || true
+  k=$(count_ids /pods "name=$POD_NAME")   # dies on an API error or a second page
   if ((k > 0)); then warn "pod $POD_NAME exists and is BILLING. Run: apply.sh pod-down"; else say "   none"; fi
   say "standing cost when idle: volume only (\$0.07/GB/month)."
 }

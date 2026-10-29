@@ -38,7 +38,7 @@ Default set: five required files plus the conv VAE, temporal upscaler and durati
    time scripts/download-models.sh
    time scripts/download-models.sh --verify    # required: full re-hash of all 41 GB
    ```
-   Before the download starts the script prints `df -hT` for the volume: check that the size is about 80 GB and the filesystem is the network volume's, not the pod's local disk. The script finds the volume at `/runpod-volume` or `/workspace` (or use `--volume-root DIR` / env `VOLUME_ROOT`), refuses to run if that path is not a mount point (so it can never fill container disk), checks free space, downloads two files at a time into `*.partial`, verifies size and sha256, then renames atomically. Expect roughly 3-7 minutes for 41 GB plus a few minutes of hashing (unmeasured). A second run downloads nothing. Only one run per volume at a time (a `flock` lock file on the volume); a second run exits with a message. If the volume filesystem does not support `flock`, the script says so (not "another run") and you can re-run with `--no-lock` (or `NO_LOCK=1`). **Warning:** `--no-lock` removes the protection against two runs corrupting each other's `.partial` files; use it only for a supervised single run with no other pod attached. The script needs bash 5.0+ (Ubuntu 22.04 pod images have 5.1) and fails early on older bash. Normal runs trust file size for files already present, so the full `--verify` after the first download is what confirms every byte.
+   Before the download starts the script prints `df -hT` for the volume: check that the filesystem is the network volume's, not the pod's local disk. **On RunPod `df` does not show 80 GB**: the volume is a slice of a shared FUSE cluster filesystem (the first run showed `mfs#us-wa-1.runpod.net:9421 fuse 615T 366T 249T 60% /runpod-volume`), and the 80 GB quota is enforced by the platform, not by `df`. The free-space guard therefore compares the integer free bytes against what is still needed, prints a note when it sees a network filesystem far larger than any volume, still refuses if even that number is too small, and exits with a clear error (never silently skipping the check) if `df` output can not be parsed. The script finds the volume at `/runpod-volume` or `/workspace` (or use `--volume-root DIR` / env `VOLUME_ROOT`), refuses to run if that path is not a mount point (so it can never fill container disk), checks free space, downloads two files at a time into `*.partial`, verifies size and sha256, then renames atomically. The first real run (cpu3c, 2 vCPU, US-WA-1) took 3 min 39 s to download 41.4 GB and about 2 min 21 s for the full `--verify` (see the Measured table). A second run downloads nothing. Only one run per volume at a time (a `flock` lock file on the volume); a second run exits with a message. If the volume filesystem does not support `flock`, the script says so (not "another run") and you can re-run with `--no-lock` (or `NO_LOCK=1`). **Warning:** `--no-lock` removes the protection against two runs corrupting each other's `.partial` files; use it only for a supervised single run with no other pod attached. The script needs bash 5.0+ (Ubuntu 22.04 pod images have 5.1) and fails early on older bash. Normal runs trust file size for files already present, so the full `--verify` after the first download is what confirms every byte.
 5. **Record the first real run** in "Measured" below, then **terminate** the pod (do not just stop it; a stopped pod keeps billing disk), and **rotate/revoke the HF token**.
 
 If the mount-point check wrongly fails on a pod (a bind mount, say), confirm with `df` that the path really is the volume, then re-run with `SKIP_MOUNT_CHECK=1`.
@@ -83,15 +83,17 @@ Filenames contain the version, so a bump leaves the old files behind and needs t
 
 With 80 GB there is room for a transformer swap with overlap (41.43 + 21.5 = 62.9 GB), so pruning first is only needed for larger changes.
 
-### Measured (fill in after the first real run)
+### Measured (first real run)
 
 | Item | Value |
 |---|---|
-| Date, pod type, datacenter | _to fill_ |
-| Download wall time (`time scripts/download-models.sh`) | _to fill_ |
-| Average download speed (41.43 GB / time) | _to fill_ |
-| Full `--verify` wall time | _to fill_ |
-| `df -hT` of the volume (size, filesystem) | _to fill_ |
+| Date, pod type, datacenter | 2026-10-29; pod `cpu3c` 2 vCPU, image `ubuntu:22.04`, US-WA-1 |
+| Download wall time (`time scripts/download-models.sh`) | 3 min 39 s (13:03:44 to 13:07:23 UTC): 41,427,929,848 bytes in 8 files |
+| Average download speed (41.43 GB / time) | about 189 MB/s (about 1.5 Gbit/s) |
+| Full `--verify` wall time | about 2 min 21 s (13:07:23 to 13:09:44 UTC) |
+| `df -hT` of the volume (size, filesystem) | `mfs#us-wa-1.runpod.net:9421 fuse 615T 366T 249T 60% /runpod-volume`: the shared cluster, not the 80 GB quota |
+| Mount checks | the `mountpoint` check passed on the FUSE mount; `flock` printed no error (two concurrent runs were not tested) |
+| Bug found | the free-space guard crashed with `((: 2.73413e+14: syntax error` (awk printed 249T in scientific notation) and the script carried on without the check; fixed, see above |
 | Cold start reading the volume (from the `endpoint` feature) | _to fill_ |
 
 ### Environment variables
@@ -184,7 +186,7 @@ RTX 6000 Ada only (`NVIDIA RTX 6000 Ada Generation`: pool `ADA_48_PRO` minus `NV
 
 ### Running the gate
 
-`scripts/smoke-job.sh` (add `--no-r2-check` if `aws`/`ffprobe` are not installed; the audio and R2 checks are then unverified). It uses `/run` + `/status` + `/health` + `/cancel` only, against the run URL in the endpoint's `requestUrls` (fallback `https://api.runpod.ai/v2/<id>`). **`--max-spend USD` (default 1.50)** is an overall guard: estimated worker time times $1.75/hr; when reached it cancels the running job and exits 3. Order: (1) canary: a missing-input i2v job, which needs good R2 secrets but never loads models. It passes when the error is `[input_fetch] input not found` (a missing key failing inside input_fetch proves the R2 credentials resolved), with a recorded note if `/status` has no separate `error_code` field; any other error (`could not fetch input`, `config_error`, auth, no prefix) stops the gate before any model job; (2) cold tiny t2v; (3) warm tiny; (4) warm default 1280x704x121; (5) second warm default; (6) wait for scale to zero, (7) cold default clip (the real first-after-idle path). **Pass** = no OOM, no offload, the second warm default job within 10% of the first, audio present, the three R2 objects exist. 46 GB peak VRAM is report-only. Offload cannot be seen from job data: read the worker logs. **Cold start** = `delayTime + executionTime` of a job minus its `gen_time_s`; the first-ever cold start can include a billed 24.75 GB image pull, so judge the second. Each job is appended to `docs/validation/endpoint-timings.csv`. It **stops and asks Ken** (exit 3) when a worker goes Unhealthy, a job stays IN_PROGRESS past 15 min (a cancel is sent), a job sits in the queue throttled past 5 min, cold start exceeds 600 s, cold-tiny start plus warm default gen time exceeds 700 s, or warm default gen time exceeds 300 s. It also stops (cancelling the job) if `/status` fails 5 polls in a row (401, 500, not JSON); the in-progress, unhealthy and queue checks keep running while polls fail. Do not work around a stop.
+`scripts/smoke-job.sh` (add `--no-r2-check` if `aws`/`ffprobe` are not installed; the audio and R2 checks are then unverified). It uses `/run` + `/status` + `/health` + `/cancel` only, against the run URL in the endpoint's `requestUrls` (fallback `https://api.runpod.ai/v2/<id>`). **`--max-spend USD` (default 3.00 for the full gate)** is an overall guard: estimated worker time times $1.75/hr, conservatively adding a 60 s idle tail and one poll interval per job; when reached it cancels the running job and exits 3. The run URL must be https on `*.runpod.ai` or `*.runpod.io` (otherwise exit 4). Every job also has a wall-clock cap (execution timeout plus 600 s, `SMOKE_JOB_WALL_S`) that cancels it and exits 3, and `/health` failing 5 polls in a row (`SMOKE_HEALTH_FAIL_LIMIT`) does the same, so a bad health route can not leave a job queued unwatched. Order: (1) canary: a missing-input i2v job, which needs good R2 secrets but never loads models. It passes when the error is `[input_fetch] input not found` (a missing key failing inside input_fetch proves the R2 credentials resolved), with a recorded note if `/status` has no separate `error_code` field; any other error (`could not fetch input`, `config_error`, auth, no prefix) stops the gate before any model job; (2) cold tiny t2v; (3) warm tiny (a new seed; every job uses a different seed so none is a ComfyUI cache hit); (3b) `repeat-same`: the exact same request as warm-tiny again, which must complete with a NEW output key (it checks the unique per-run OUTPUT prefix on the real worker); (4) warm default 1280x704x121; (5) second warm default; (6) wait for scale to zero, (7) cold default clip (the real first-after-idle path). **Pass** = no OOM, no offload, the second warm default job within 10% of the first, audio present, the three R2 objects exist. 46 GB peak VRAM is report-only. Offload cannot be seen from job data: read the worker logs. **Cold start** = worker start + model-load overhead, where worker start = `delayTime + executionTime - gen_time_s` and model-load overhead = `gen_time_s` of the cold job minus `gen_time_s` of the matching warm job (cold-tiny vs warm-tiny, cold-def vs warm-def). The model load runs inside the first job, so it is part of `gen_time_s`; the first real run printed 2.4 s for a load of about 120 s with the old formula. The 180 s flag and 600 s hard stop apply to this sum. The first-ever cold start can include a billed 24.75 GB image pull, so judge the second. Each job is appended to `docs/validation/endpoint-timings.csv`. It **stops and asks Ken** (exit 3) when a worker goes Unhealthy, a job stays IN_PROGRESS past 15 min (a cancel is sent), a job sits in the queue throttled past 5 min, cold start exceeds 600 s, cold-tiny start plus warm default gen time exceeds 700 s, or warm default gen time exceeds 300 s. It also stops (cancelling the job) if `/status` fails 5 polls in a row (401, 500, not JSON); the in-progress, unhealthy and queue checks keep running while polls fail. Do not work around a stop.
 
 ### Teardown and recovery
 
@@ -196,11 +198,19 @@ RTX 6000 Ada only (`NVIDIA RTX 6000 Ada Generation`: pool `ADA_48_PRO` minus `NV
 
 | Item | Value |
 |---|---|
-| Cold start, first ever / second (delay + exec - gen) | _to fill_ |
+| Cold start, first ever / second (worker start + model-load overhead) | _to fill_ |
 | Warm default clip `gen_time_s` (1280x704x121) | _to fill_ |
 | Cold + default clip total (user path) | _to fill_ |
 | Peak VRAM (`peak_vram_mb`) | _to fill_ |
 | Cost per clip, measured | _to fill (SPEC §7's 3-minute example assumes cold+gen about 3 min)_ |
+
+#### First real gate run (2026-10-29)
+
+- The canary passed: the R2 secrets resolve on the worker, and `/status` exposes `error_code`.
+- A cold 256x256x25 t2v job on the RTX 6000 Ada completed in 125 s total (`gen_time_s` 123 s, which includes about 100+ s of model loading from the network volume; ComfyUI logged `Prompt executed in 122.33 seconds`).
+- Peak VRAM was 39,473 MiB (report-only). The mp4 has an AAC 48 kHz stereo audio stream, and the three objects reached R2.
+- Three bugs found and fixed afterwards: (1) `smoke-job.sh` reported "audio stream: MISSING" on a clip that has audio, because `ffprobe | grep -q` under `set -o pipefail` dies of SIGPIPE (the offline stubs wrote instantly, so tests missed it); (2) an identical repeated request (same prompt, seed, size) was served entirely from ComfyUI's cache (`Prompt executed in 0.01 seconds`) and failed with `[output_missing] node OUTPUT produced no mp4`; the worker now makes the OUTPUT `filename_prefix` unique per run; (3) the cold-start number was wrong because the model load sits inside `gen_time_s` (see the definition above).
+- Two observations are unexplained: workers stayed IDLE/INITIALIZING well past the 60 s idle timeout, twice. The endpoint was parked by hand with max workers 0.
 
 ### Tests
 

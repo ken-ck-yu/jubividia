@@ -236,7 +236,8 @@ class H(BaseHTTPRequestHandler):
                     rows = [r for r in rows if r["name"].lower() == want]
                 out = {wrap: rows}
                 if coll != "secrets":
-                    out["pagination"] = {"nextCursor": None, "hasNextPage": False}
+                    more = bool(S["flags"].get(f"{coll}_next_page"))
+                    out["pagination"] = {"nextCursor": "c2" if more else None, "hasNextPage": more}
                 return self.send(200, out)
             if m == "POST":
                 return self.create(coll, b)
@@ -425,6 +426,10 @@ class H(BaseHTTPRequestHandler):
         op = parts[2]
         if op == "health":
             fl = S["flags"]
+            if fl.get("health_fail"):
+                if fl["health_fail"] == "garbage":
+                    return self.send(200, raw=b"<html>not json</html>", ctype="text/html")
+                return self.problem(int(fl["health_fail"]), "simulated /health failure")
             w = {"idle": 0, "running": 0, "initializing": 0, "ready": 0,
                  "throttled": int(fl.get("throttled", 0)), "unhealthy": int(fl.get("unhealthy", 0))}
             c = S["health_calls_after_done"]
@@ -458,6 +463,8 @@ class H(BaseHTTPRequestHandler):
             if fl["status_fail"] == "garbage":
                 return self.send(200, raw=b"<html>not json</html>", ctype="text/html")
             return self.problem(int(fl["status_fail"]), "simulated /status failure")
+        if fl.get("queued_forever"):
+            return self.send(200, {"id": jid, "status": "IN_QUEUE"})
         if fl.get("stuck"):
             return self.send(200, {"id": jid, "status": "IN_PROGRESS"})
         if job["polls"] == 1:
@@ -481,16 +488,29 @@ class H(BaseHTTPRequestHandler):
                 S["default_runs"] += 1
             else:
                 gen = 5.0
+            # The model load happens inside the first job, so it is part of gen_time_s (like the real worker).
+            gen = round(gen + (float(fl.get("load_overhead", 100.0)) if cold else 0.0), 2)
+            sig = json.dumps(inp, sort_keys=True)
+            repeat = sig in S.setdefault("seen_inputs", [])
+            S["seen_inputs"].append(sig)
             S["completed"] += 1
-            S["health_calls_after_done"] = 2
-            stem = f"outputs/2026-10-29/20261029T000000-{jid}"
+            S["health_calls_after_done"] = 6
+            if repeat and fl.get("cache_bug"):
+                # the bug found on the real run: identical request, nothing re-ran, no output file
+                msg = "[output_missing] node OUTPUT produced no mp4"
+                job["result"] = {"id": jid, "status": "FAILED", "error": msg,
+                                 "output": {"error": msg, "error_code": "output_missing"},
+                                 "delayTime": 200, "executionTime": 10}
+                return self.send(200, job["result"])
+            tag = __import__("hashlib").md5(sig.encode()).hexdigest()[:8] if fl.get("same_key") else jid
+            stem = f"outputs/2026-10-29/20261029T000000-{tag}"
             out = {"v": 1, "key": stem + ".mp4", "thumb_key": stem + ".jpg", "meta_key": stem + ".json",
                    "gen_time_s": gen, "cold": cold, "width": inp.get("width"), "height": inp.get("height"),
                    "num_frames": inp.get("num_frames"), "fps": inp.get("fps"), "seed": inp.get("seed"),
                    "peak_vram_mb": 40000 + S["completed"]}
             job["result"] = {"id": jid, "status": "COMPLETED", "output": out,
                              "delayTime": 45000 if cold else 200,
-                             "executionTime": int((gen + (30 if cold else 0)) * 1000)}
+                             "executionTime": int((gen + 3) * 1000)}
         return self.send(200, job["result"])
 
 

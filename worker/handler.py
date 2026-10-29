@@ -43,6 +43,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 
 import boto3
 import requests
@@ -433,7 +434,18 @@ def load_workflow(mode):
     return wf
 
 
-def fill_workflow(wf, p, input_name):
+def unique_prefix_suffix(jid):
+    """Per-run token for the OUTPUT node's filename_prefix.
+
+    ComfyUI caches by node inputs: an identical request (same prompt, seed, size) re-runs
+    nothing, the save node is served from cache and reports no output file. A prefix that
+    differs on every run makes only the save node re-execute while the expensive upstream
+    results stay cached. The random part also covers a retry that reuses the same job id.
+    """
+    return f"{safe_id(jid)[:40]}_{uuid.uuid4().hex[:8]}"
+
+
+def fill_workflow(wf, p, input_name, prefix_suffix=None):
     by_title = {}
     for node in wf.values():
         meta = node.get("_meta")
@@ -463,6 +475,12 @@ def fill_workflow(wf, p, input_name):
     put("SEED", NODE_FIELDS["SEED"], p["seed"])
     if p["mode"] in INPUT_FIELDS:
         put("INPUT", INPUT_FIELDS[p["mode"]], input_name)
+    if prefix_suffix:
+        # keep the workflow-version marker (..._wfN) in the prefix, add the run token after it
+        for node in by_title.get(OUTPUT_TITLE, []):
+            pre = node["inputs"].get("filename_prefix")
+            if isinstance(pre, str):
+                node["inputs"]["filename_prefix"] = f"{pre}_{prefix_suffix}"
     return wf
 
 
@@ -640,7 +658,8 @@ def run_job(job):
     created = []
     try:
         # Cheap local checks first, then the input download, then the wait on ComfyUI.
-        wf = fill_workflow(load_workflow(p["mode"]), p, input_name)
+        wf = fill_workflow(load_workflow(p["mode"]), p, input_name,
+                           prefix_suffix=unique_prefix_suffix(jid))
         if p["input_key"]:
             dest = os.path.join(COMFY_ROOT, "input", input_name)
             os.makedirs(os.path.dirname(dest), exist_ok=True)

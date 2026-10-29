@@ -158,7 +158,11 @@ explain_http() { # code url
 
 check_curl() {
   command -v curl >/dev/null || die "curl not found"
-  curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' || die "curl too old (need 7.71+ for --retry-all-errors)"
+  # capture first: `curl --help all | grep -q` lets grep exit early, curl gets SIGPIPE and
+  # pipefail turns that into a false "too old"
+  local help
+  help=$(curl --help all 2>/dev/null) || true
+  [[ $help == *--retry-all-errors* ]] || die "curl too old (need 7.71+ for --retry-all-errors)"
 }
 
 # ---------------------------------------------------------------- volume
@@ -313,6 +317,25 @@ fetch_one() {
   echo "FAILED verification (sha256/size mismatch after retry)" >"$WORK/$i"
 }
 
+# Free bytes on the volume, as an integer. Never goes through awk arithmetic or floating
+# point (a 249T value printed as 2.73413e+14 once broke the guard), and a df line that
+# can not be parsed is a loud error, not a skipped check.
+NETFS_RE='^(fuse|fuseblk|fuse\..*|nfs[0-9]*|cifs|smb3?|smbfs|ceph|glusterfs|lustre|9p|beegfs|moosefs|mfs)$'
+NETFS_PLAUSIBLE_KB=$((4 * 1024 * 1024 * 1024)) # 4 TiB in KiB; RunPod volumes max out at 4096 GB
+volume_free_bytes() {
+  local line fs fstype size_kb used_kb avail_kb
+  line=$(df -PkT "$VOLUME_ROOT" 2>/dev/null | awk 'NR==2') || line=
+  # shellcheck disable=SC2034
+  read -r fs fstype size_kb used_kb avail_kb _ <<<"$line"
+  if ! [[ $size_kb =~ ^[0-9]+$ && $avail_kb =~ ^[0-9]+$ && -n $fstype ]]; then
+    die "could not parse the free space of $VOLUME_ROOT from 'df -PkT' (got: '${line:-nothing}'). Refusing to continue without a free-space check; verify the volume size by hand."
+  fi
+  if [[ $fstype =~ $NETFS_RE ]] && ((size_kb > NETFS_PLAUSIBLE_KB)); then
+    log "note: $VOLUME_ROOT is a shared network filesystem ($fstype) reporting $((size_kb / 1024 / 1024 / 1024)) TiB in total, far more than any volume. The volume quota set on RunPod, not df, is the real limit; the free figure below is the cluster's. Still refusing if even that is too small."
+  fi
+  printf '%s' "$((avail_kb * 1024))"
+}
+
 do_download() {
   local i f need=0 have free total=0 st failed=0 smallest=-1 code url
   refuse_if_pending
@@ -338,9 +361,9 @@ do_download() {
   prune_orphan_partials
 
   if ((${#todo[@]} > 0)); then
-    log "volume $VOLUME_ROOT (check the size and type match the network volume, ~80 GB):"
+    log "volume $VOLUME_ROOT (on a RunPod network volume df shows the shared cluster filesystem, not the 80 GB quota):"
     df -hT "$VOLUME_ROOT" >&2 || true
-    free=$(df -Pk "$VOLUME_ROOT" | awk 'NR==2{print $4*1024}')
+    free=$(volume_free_bytes)
     if ((free < need + FREE_SLACK_BYTES)); then
       die "not enough free space on $VOLUME_ROOT: need $((need + FREE_SLACK_BYTES)) bytes (missing files + slack), have $free. Run --prune, or grow the volume."
     fi
@@ -405,7 +428,7 @@ do_update_lock() {
   url="$HF_ENDPOINT/api/models/$LOCK_REPO/tree/$rev?recursive=true"
   while [[ -n $url ]]; do
     code_get "$url" "$tmp/page.$n.json" "$tmp/page.$n.hdr"
-    next=$(sed -n 's/^[Ll]ink:.*<\([^>]*\)>; *rel="next".*/\1/p' "$tmp/page.$n.hdr" | head -n1)
+    next=$(sed -n 's/^[Ll]ink:.*<\([^>]*\)>; *rel="next".*/\1/p' "$tmp/page.$n.hdr" | awk 'NR==1')   # awk reads to the end: no SIGPIPE for sed under pipefail
     if [[ -n $next && $next != "$HF_ENDPOINT"/* ]]; then die "pagination link leaves $HF_ENDPOINT; aborting (token safety)"; fi
     url=$next
     n=$((n + 1))

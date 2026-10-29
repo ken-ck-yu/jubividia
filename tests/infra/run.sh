@@ -42,7 +42,7 @@ chmod +x "$SHIM/curl"
 
 # ---------------------------------------------------------------- helpers
 t() { if (($# < 3)); then FAIL=$((FAIL + 1)); echo "FAIL: $1: test bug, missing argument"; elif [[ $3 == "$2" ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "FAIL: $1: expected [$2] got [$3]"; fi; }
-tc() { if [[ $2 == *"$3"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "FAIL: $1: output lacks [$3]: ${2:0:300}"; fi; }
+tc() { if [[ $2 == *"$3"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "FAIL: $1: output lacks [$3]: ${2:0:${TC_MAX:-300}}"; fi; }
 tn() { if [[ $2 != *"$3"* ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "FAIL: $1: output unexpectedly has [$3]"; fi; }
 tnz() { if [[ $2 != 0 ]]; then PASS=$((PASS + 1)); else FAIL=$((FAIL + 1)); echo "FAIL: $1: expected a non-zero exit"; fi; }
 
@@ -503,10 +503,12 @@ out=$(SM --no-r2-check 2>&1); rc=$?
 t "gate passes" 0 "$rc"
 tc "gate verdict" "$out" "GATE: PASS"
 tc "canary recognised" "$out" "canary OK"
-tc "cold start formula (45000+35000)/1000-5" "$out" "= 75.0 s"
+tc "worker start = (45000+108000)/1000-105" "$out" "= 48.0 s"
+tc "cold start = worker start + model-load overhead (105-5)" "$out" "model-load overhead 100.0 s"
+tc "cold start total" "$out" "= 148.0 s"
 tc "second warm within 10%" "$out" "within 10% of the first"
 tc "peak vram reported" "$out" "peak_vram_mb=40"
-t "csv has header + 6 jobs" 7 "$(wc -l <"$T/t.csv")"
+t "csv has header + 7 jobs" 8 "$(wc -l <"$T/t.csv")"
 tc "csv records cold flag true" "$(cat "$T/t.csv")" ",cold-tiny,"
 t "only /run /status /health /cancel used" 0 "$(ctl log | pj 'sum(1 for x in d if x["path"].startswith("/rt/") and x["path"].split("/")[3] not in ("run","status","health","cancel"))')"
 for s in "${SENTINELS[@]}"; do tn "gate output has no $s" "$out" "$s"; done
@@ -534,7 +536,7 @@ new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"no_error_code":true}'
 out=$(SM --no-r2-check 2>&1); rc=$?
 t "missing error_code with [input_fetch] prefix -> canary passes" 0 "$rc"
 tc "missing error_code is recorded as a note" "$out" "no separate error_code field"
-t "gate ran all jobs after the noted canary" 6 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+t "gate ran all jobs after the noted canary" 7 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
 
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"canary_error":"[config_error] worker misconfigured: R2_ACCESS_KEY_ID not set","no_error_code":true}'
 out=$(SM --no-r2-check 2>&1); rc=$?
@@ -567,7 +569,7 @@ out=$(SM --no-r2-check --max-spend lots 2>&1); rc=$?
 tnz "bad --max-spend rejected" "$rc"
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
 out=$(SM --no-r2-check 2>&1); tc "summary reports estimated spend" "$out" "estimated spend: \$"
-tc "summary shows the default cap" "$out" "cap \$1.50"
+tc "summary shows the default cap" "$out" "cap \$3.00"
 
 # Q4: no pinned image tag, no gate
 for bad in "" latest; do
@@ -587,6 +589,111 @@ new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
 ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"https://api.runpod.ai/v2/ep-1/run\"}}}"
 out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
 t "non-loopback requestUrls refused in test mode" 4 "$rc"
+
+# real-run findings: seeds, repeat-same, cold start definition
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check 2>&1); rc=$?
+t "gate with repeat-same passes" 0 "$rc"
+tc "repeat-same ran and got a new key" "$out" "repeat-same completed with a new output key"
+SEEDS=$(ctl log | pj '",".join(str(x["body"]["input"].get("seed")) for x in d if x["method"]=="POST" and x["path"].endswith("/run"))')
+t "seeds: canary has none, repeat-same repeats warm-tiny, every other job differs" "None,1000,1001,1001,1002,1003,1004" "$SEEDS"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"cache_bug":true}'
+out=$(SM --no-r2-check 2>&1); rc=$?
+t "repeat-same failing (cache bug) fails the gate" 1 "$rc"; tc "repeat-same failure is named" "$out" "repeat-same: job ended FAILED"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"same_key":true}'
+out=$(SM --no-r2-check 2>&1); rc=$?
+t "repeat-same returning the same key fails the gate" 1 "$rc"; tc "same-key message" "$out" "SAME output key"
+# cold start includes the model-load overhead (cold gen - warm gen)
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"load_overhead":150}'
+out=$(SM --no-r2-check 2>&1); rc=$?
+tc "overhead 150 s: cold start 198 s" "$out" "= 198.0 s"
+tc "cold start over 180 s is flagged" "$out" "> 180s (flag"
+t "a flagged cold start does not fail the gate" 0 "$rc"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"load_overhead":700}'
+out=$(SM --no-r2-check 2>&1); rc=$?
+t "cold start over 600 s stops the gate" 3 "$rc"; tc "hard-stop message" "$out" "exceeds the 600s hard limit"
+
+# audio detection must not depend on how ffprobe writes (SIGPIPE under pipefail)
+mkdir -p "$T/slowstub"
+cat >"$T/slowstub/aws" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" head-object "*) echo video/mp4 ;;
+  *" cp "*) for a; do last=$a; done; echo data >"$last" ;;
+esac
+EOF
+cat >"$T/slowstub/ffprobe" <<'EOF'
+#!/usr/bin/env bash
+# audio stream first, then a lot of output written slowly: a reader that quits at the first match makes this die of SIGPIPE
+printf '{"streams":[\n{"codec_type": "audio","duration":"5.0"},\n{"codec_type": "video"}\n],"pad":"\n'
+for i in $(seq 1 60); do head -c 65536 /dev/zero | tr '\0' x; echo; sleep 0.02; done
+printf '"}\n'
+EOF
+chmod +x "$T/slowstub/aws" "$T/slowstub/ffprobe"
+naive=$(bash -c 'set -o pipefail; if "$0" | grep -q "\"codec_type\": *\"audio\""; then echo found; else echo missed; fi' "$T/slowstub/ffprobe" 2>/dev/null)
+t "the slow stub reproduces the pipefail pitfall with the old pipeline" missed "$naive"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; rm -f "$T/t.csv"
+out=$(SMOKE_ALLOW_STUB_AWS=1 PATH="$T/slowstub:$PATH" SM 2>&1); rc=$?
+tc "slow, chatty ffprobe: audio is detected" "$out" "audio stream: present"
+tn "slow ffprobe: no false MISSING" "$out" "audio stream: MISSING"
+t "slow ffprobe: gate passes" 0 "$rc"
+
+# N3: requestUrls.run host is pinned to RunPod domains
+for bad in "https://evil.example/v2/ep-1/run" "https://api.runpod.ai.evil.com/v2/ep-1/run" "http://api.runpod.ai/v2/ep-1/run" \
+  "https://runpod.ai@evil.com/v2/ep-1/run" "https://evilrunpod.ai/v2/ep-1/run" "https://api.runpod.io#@evil.com/run"; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+  ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"$bad\"}}}"
+  out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
+  t "requestUrls $bad refused" 4 "$rc"
+  tc "requestUrls $bad: pin message" "$out" "not a RunPod domain"
+  t "requestUrls $bad: no job submitted" 0 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+done
+for good in "https://api.runpod.ai/v2/ep-1/run" "https://ep-1.api.runpod.io/run"; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+  ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"$good\"}}}"
+  out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
+  tc "RunPod URL $good passes the pin (then test mode refuses the network)" "$out" "TEST MODE refuses non-loopback"
+  tn "RunPod URL $good is not called a bad domain" "$out" "not a RunPod domain"
+done
+
+# N1: /health failing while /status says IN_QUEUE forever must still stop and cancel
+for mode in 500 garbage; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set "{\"queued_forever\":true,\"health_fail\":\"$mode\"}"
+  out=$(SMOKE_HEALTH_FAIL_LIMIT=3 SM --no-r2-check 2>&1); rc=$?
+  t "/health $mode + queued forever -> stop" 3 "$rc"
+  tc "/health $mode message" "$out" "/health failed 3 polls in a row"
+  t "/health $mode: cancel sent" 1 "$(count_calls POST /rt/ep-1/cancel | awk '{print ($1>=1)?1:0}')"
+done
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"queued_forever":true,"health_fail":"500"}'
+out=$(SMOKE_HEALTH_FAIL_LIMIT=100000 SMOKE_JOB_WALL_S=1 SM --no-r2-check 2>&1); rc=$?
+t "wall-clock cap stops a job even when nothing else trips" 3 "$rc"; tc "wall-clock message" "$out" "wall-clock"
+t "wall-clock cap sent a cancel" 1 "$(count_calls POST /rt/ep-1/cancel | awk '{print ($1>=1)?1:0}')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"queued_forever":true}'
+out=$(SMOKE_JOB_WALL_S=1 SM --no-r2-check 2>&1); rc=$?
+t "wall-clock cap with healthy /health and an endless queue" 3 "$rc"
+tc "default wall cap is derived from the execution timeout" "$(grep -c 'JOB_WALL_S=\${SMOKE_JOB_WALL_S:-\$((EXEC_S + 600))}' "$SMOKE")" 1
+
+# N2: the stop message names the failing poll's HTTP status, not the cancel call's
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"status_fail":"500"}'
+out=$(SMOKE_POLL_FAIL_LIMIT=2 SM --no-r2-check 2>&1)
+tc "stop message reports the /status HTTP code" "$out" "last HTTP 500"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"queued_forever":true,"health_fail":"503"}'
+out=$(SMOKE_HEALTH_FAIL_LIMIT=2 SM --no-r2-check 2>&1)
+tc "stop message reports the /health HTTP code" "$out" "last HTTP 503"
+
+# N4: the spend estimate includes a 60 s idle tail per job (about $0.029), so a $0.02 cap trips after the canary
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check --max-spend 0.02 2>&1); rc=$?
+t "idle tail makes a tiny cap trip after one job" 3 "$rc"; tc "tail spend message" "$out" "reached --max-spend"
+t "capped run stopped after the canary" 1 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check 2>&1); tc "full gate stays under the 3.00 default" "$out" "GATE: PASS"
+
+# N5: status aborts on a second page of pods
+new_fake; full_apply; A pod-up >/dev/null 2>&1
+ctl_set '{"pods_next_page":true}'
+out=$(A status 2>&1); rc=$?
+tnz "status aborts when the pod list has a second page" "$rc"; tc "second-page message" "$out" "more than one page"
 
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"default_gen":[310.0]}'
 out=$(SM --no-r2-check 2>&1); rc=$?
