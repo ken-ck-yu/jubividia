@@ -1,2 +1,117 @@
 <!doctype html>
-<title>jubividia</title>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="robots" content="noindex, nofollow">
+  <title>jubividia</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+<main>
+  <header class="strip" aria-live="polite">
+    <span id="gpu-badge" class="badge">GPU: checking...</span>
+    <span id="usage" class="muted"></span>
+  </header>
+
+  <section aria-labelledby="h-create">
+    <h1 id="h-create">New clip</h1>
+
+    <fieldset class="modes">
+      <legend class="sr">Mode</legend>
+      <label><input type="radio" name="mode" value="t2v" checked><span>Text</span></label>
+      <label><input type="radio" name="mode" value="i2v"><span>Image</span></label>
+      <label><input type="radio" name="mode" value="v2v"><span>Video continue</span></label>
+    </fieldset>
+    <p id="mode-help" class="help"></p>
+
+    <div id="file-section" hidden>
+      <label class="filebtn" for="file" id="file-label">Choose from photos</label>
+      <input id="file" type="file" class="sr">
+      <p id="file-error" class="error" role="alert" hidden></p>
+      <div id="file-preview" class="preview" hidden></div>
+      <p id="file-info" class="muted"></p>
+    </div>
+
+    <label for="prompt" class="field-label">Prompt <span id="prompt-count" class="muted"></span></label>
+    <textarea id="prompt" rows="4" maxlength="2000" placeholder="A fox trots through fresh snow at sunrise, soft footsteps and distant birdsong"></textarea>
+    <p class="help">Sound is generated from the prompt too, so describe what it should sound like.</p>
+
+    <details id="advanced">
+      <summary>Advanced</summary>
+      <div class="adv">
+        <label for="seed">Seed (blank = random)</label>
+        <div class="row">
+          <input id="seed" type="number" inputmode="numeric" min="0" max="4294967295" step="1">
+          <button type="button" id="reuse-seed" class="small" disabled>Reuse last</button>
+        </div>
+
+        <div class="row presets" role="group" aria-label="Size shortcuts">
+          <button type="button" class="small preset" data-w="1280" data-h="704">Landscape 1280x704</button>
+          <button type="button" class="small preset" data-w="704" data-h="1280">Portrait 704x1280</button>
+          <button type="button" class="small preset" data-w="832" data-h="832">Square 832x832</button>
+          <button type="button" class="small preset" data-w="640" data-h="384">Fast 640x384</button>
+        </div>
+        <div class="grid2">
+          <div>
+            <label for="width">Width</label>
+            <input id="width" type="number" inputmode="numeric" min="256" max="2048" step="64" value="1280">
+          </div>
+          <div>
+            <label for="height">Height</label>
+            <input id="height" type="number" inputmode="numeric" min="256" max="2048" step="64" value="704">
+          </div>
+          <div>
+            <label for="duration">Length (seconds)</label>
+            <input id="duration" type="number" inputmode="decimal" min="0.3" max="20" step="0.1" value="5">
+          </div>
+          <div>
+            <label for="fps">Frames per second</label>
+            <input id="fps" type="number" inputmode="numeric" min="1" max="60" step="1" value="24">
+          </div>
+        </div>
+        <p id="frames-info" class="muted"></p>
+        <p class="help">Sizes are multiples of 64, 256 to 2048. At most 481 frames. The measured, safe size is 1280x704 for 5 seconds.</p>
+      </div>
+    </details>
+
+    <p id="untested-warning" class="warn" role="alert" hidden></p>
+    <p id="form-error" class="error" role="alert" hidden></p>
+
+    <button type="button" id="generate" class="primary" disabled>Generate</button>
+    <p id="generate-hint" class="muted"></p>
+  </section>
+
+  <section id="progress" class="card" hidden aria-live="polite">
+    <h2 id="progress-label">Working</h2>
+    <p id="progress-explain"></p>
+    <progress id="upload-bar" max="100" value="0" hidden></progress>
+    <p class="row between"><span id="elapsed" class="mono">0:00</span><span id="expected" class="muted"></span></p>
+    <button type="button" id="cancel" class="small" hidden>Cancel</button>
+    <p id="progress-error" class="error" hidden></p>
+    <details id="error-details" hidden><summary>Details</summary><pre id="error-text"></pre></details>
+  </section>
+
+  <section id="result" class="card" hidden>
+    <h2>Result</h2>
+    <video id="player" controls playsinline preload="metadata"></video>
+    <p id="result-stats" class="stats"></p>
+    <p id="result-prompt" class="prompt-text"></p>
+    <div class="row">
+      <a id="download" class="button small" href="#">Download</a>
+      <button type="button" id="share" class="small" hidden>Share</button>
+    </div>
+    <p id="v2v-tip" class="help" hidden>To join the clips, skip the first second of this new clip: it repeats the end of your original.</p>
+  </section>
+
+  <section aria-labelledby="h-gallery">
+    <h2 id="h-gallery">Gallery</h2>
+    <div id="gallery" class="gallery"></div>
+    <p id="gallery-empty" class="muted" hidden>No clips yet.</p>
+    <button type="button" id="load-more" class="small" hidden>Load more</button>
+  </section>
+</main>
+</body>
+</html>

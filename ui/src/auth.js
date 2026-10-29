@@ -1,4 +1,4 @@
-// Cloudflare Access JWT verification. There is exactly one verification path and no bypass:
+// Cloudflare Access JWT verification. There is exactly one verification path and no escape hatch:
 // every request, including static files, is verified. Missing configuration fails closed.
 import { createRemoteJWKSet, jwtVerify } from "jose";
 

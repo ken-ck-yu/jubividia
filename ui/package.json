@@ -6,7 +6,7 @@
   "description": "jubividia front end: one Cloudflare Worker (static page + API in front of RunPod and R2)",
   "scripts": {
     "dev": "wrangler dev --local",
-    "test": "vitest run",
+    "test": "node scripts/check-static.mjs && vitest run",
     "check": "node scripts/check-static.mjs"
   },
   "dependencies": {
