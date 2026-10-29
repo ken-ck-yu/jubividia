@@ -1,0 +1,59 @@
+name: test
+
+# Offline tests only: no secrets, no Cloudflare or RunPod access, no Docker image builds.
+# Separate from build-worker.yml (which builds on push to main for worker/** only).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install shellcheck
+        run: pip install shellcheck-py
+
+      - name: Worker handler tests and lint
+        run: |
+          make lint
+          make test
+
+      - name: Infra tests (RunPod apply.sh and smoke-job.sh against a fake)
+        run: make -f infra/runpod/infra.mk lint-infra test-infra
+
+      - name: Models tests
+        run: make -f scripts/models.mk lint-models test-models
+
+      - name: Workflow static checks
+        run: make -f scripts/workflows.mk test-workflows LOCK=scripts/models.lock
+
+      - name: UI Worker tests (workerd, fakes only)
+        run: |
+          npm --prefix ui ci
+          npm --prefix ui test
+
+      - name: Cloudflare apply.sh tests (fake API on 127.0.0.1)
+        run: |
+          make -f infra/cloudflare/cf.mk lint-cloudflare
+          bash tests/cloudflare/run.sh

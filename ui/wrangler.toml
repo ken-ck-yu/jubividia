@@ -1,0 +1,30 @@
+# jubividia front end: one Worker, workers.dev only. No secrets and no personal data in this file.
+# Secrets (set with infra/cloudflare/apply.sh secrets, only after the Access app is verified):
+#   RUNPOD_API_KEY  RUNPOD_ENDPOINT_ID  ALLOWED_EMAILS (comma-separated)  TEAM_DOMAIN  POLICY_AUD
+# Until they exist every request gets 503 (fail closed).
+name = "jubividia"
+main = "src/index.js"
+# Must not be newer than the workerd bundled with the pinned tools (the test pool's is 2026-08-22).
+compatibility_date = "2026-08-01"
+workers_dev = true
+# Explicit on purpose: omitting it leaves an existing setting alone, and Wrangler defaults
+# vary by version. Preview URLs stay off.
+preview_urls = false
+
+[assets]
+directory = "./static"
+binding = "ASSETS"
+# Every request, static files included, goes through the Worker so the Access JWT is checked.
+run_worker_first = true
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "jubividia-ltx-eu"
+
+[vars]
+GPU_USD_PER_HR = "1.75"
+# Clips (attempts, failed ones included) per UTC day. Change here and redeploy.
+DAILY_CAP = "30"
+
+[observability]
+enabled = true

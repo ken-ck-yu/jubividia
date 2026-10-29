@@ -250,3 +250,41 @@ make -f infra/runpod/infra.mk test-infra
 ```
 
 Plain bash plus a stdlib Python fake of the RunPod REST API, serverless runtime and GHCR, all on 127.0.0.1. It covers idempotency, `--dry-run`, the three REST traps, kill between create and write-back, tag rejection, secret hygiene (output, `bash -x`, curl argv, temp files), the no-delete grep, read-back mismatch handling and the gate runner. `make -f infra/runpod/infra.mk lint-infra` runs `bash -n` and `shellcheck` when installed.
+
+## UI (`ui/`, `infra/cloudflare/`)
+
+One Cloudflare Worker named `jubividia` on `workers.dev`: a mobile-first page (Text / Image / Video continue, camera-roll picker, prompt, Advanced, progress with elapsed time, inline player with sound, shared gallery with gen time, peak VRAM and estimated cost) plus a small API in front of the RunPod endpoint and the R2 bucket `jubividia-ltx-eu`. Design and decisions: `docs/decisions/ui.md`.
+
+### Who can use it
+
+Two people (Ken and a second person). Cloudflare Access (one-time PIN, 24 h session) is the front door; the Worker also verifies the `Cf-Access-Jwt-Assertion` JWT on every request (issuer, audience, `email` claim, small clock tolerance) and fails closed (503 with no secrets, 403 for anyone not listed). The login method is not checked, only the JWT. The gallery, the daily cap and the one-active-job lock are shared; each person sees "Signed in as ..." in the header. Private galleries would be a later change (needs an owner field from the worker).
+
+### Setup from zero
+
+1. Local: `cd ui && npm ci && npm test` (no Cloudflare, no RunPod: everything is faked), `npm run dev` for `wrangler dev --local` (R2 is simulated in `.wrangler/`; it answers 503 until `.dev.vars` has the five names below and a reachable JWKS, because there is no auth bypass).
+2. Ken creates a short-lived Cloudflare API token (dashboard) with exactly: Workers Scripts Edit, Workers R2 Storage Edit, Account Settings Read. No Zero Trust scope. Put it in `config.env` as `CLOUDFLARE_API_TOKEN` (the account id is `R2_ACCOUNT_ID`). Also add `UI_RUNPOD_API_KEY` (a RunPod key restricted to the `jubividia-ltx25` endpoint; it must differ from `RUNPOD_API_KEY`), `RUNPOD_ENDPOINT_ID`, and, for the last step only, `ALLOWED_EMAILS`, `TEAM_DOMAIN`, `POLICY_AUD`. See `config.env.example`.
+3. `infra/cloudflare/apply.sh preflight` (read-only; records the baseline `modified_on` of the other Workers in `.scratch/cloudflare/`). Stops if the account has no workers.dev subdomain (it is account-wide; it is never created or renamed here).
+4. `infra/cloudflare/apply.sh lifecycle` adds `inputs-expire-7d`, `state-expire-40d`, `abort-multipart-1d` (reads the existing rules and writes them back unchanged plus ours).
+5. `infra/cloudflare/apply.sh deploy` deploys the Worker with no secrets (fails closed, 503), then asserts the Worker identity, `workers_dev` on, preview URLs off, other Workers unchanged.
+6. **Ken, in the dashboard:** Workers & Pages > `jubividia` > Settings > "Protect this Worker behind Access" (all traffic). If the Zero Trust organisation is new, create it (Free plan: 50 users; payment details are asked, nothing is charged) and add the One-time PIN login method. In the application's policy, Allow, Include: Emails: **both** addresses. Session duration 24 h. Note the application's Audience (AUD) tag and the team domain `https://<team>.cloudflareaccess.com`.
+7. `infra/cloudflare/apply.sh verify-access`: an unauthenticated request to `https://jubividia.<subdomain>.workers.dev/` (and `/api/state`, and one carrying a forged `Cf-Access-Jwt-Assertion`) must be redirected to the Access login. Anything else fails and `secrets` refuses to run.
+8. Ken adds `ALLOWED_EMAILS` (comma-separated), `TEAM_DOMAIN`, `POLICY_AUD` to `config.env`, then `infra/cloudflare/apply.sh secrets --i-confirmed-access` sets the five Worker secrets (`RUNPOD_API_KEY`, `RUNPOD_ENDPOINT_ID`, `ALLOWED_EMAILS`, `TEAM_DOMAIN`, `POLICY_AUD`) through the API; values are never printed.
+9. `infra/cloudflare/apply.sh postcheck`; then Ken revokes the API token. Later Worker updates need a new short-lived token (`preflight`, `deploy`, `postcheck`).
+
+All subcommands accept `--dry-run` (no Cloudflare write). `teardown` prints the undo steps. Offline tests: `bash tests/cloudflare/run.sh` (fake Cloudflare API on 127.0.0.1; test mode refuses any other host).
+
+### Limits and cost
+
+- One active job at a time (compare-and-swap reservation in R2 `state/active.json`; also refused while RunPod `/health` shows jobs in flight; a timed-out submit keeps the lock; Cancel keeps it until RunPod reports a terminal state).
+- `DAILY_CAP` clips per UTC day, default 30, shared, failed attempts count (var in `ui/wrangler.toml`; the page shows the reset time in the viewer's local time).
+- Job policy on every submit: `ttl` 35 min, `executionTimeout` 900000 ms. A run is capped at 15 minutes. Realistic worst case per job at $1.75/hr: up to about $0.65 (15 min run cap + GPU boot ~105 s + 180 s idle tail + scale-down lag margin), from one constant in `ui/static/calc.js`.
+- Sizes are free within the handler's bounds (256..2048 per side, multiples of 64, up to 481 frames). Beyond the measured 1280x704x121 the page warns (untested, may fail or run out of memory, a failed run still bills) and shows the worst case. Every finished clip shows `gen_time_s`, peak VRAM and an estimated cost.
+- Uploads: 95 MB for video, 20 MB for images (the page shrinks photos to 2048 px JPEG first). JPEG, PNG, WebP, MP4, MOV only; WebM and HEIC are refused. Chunked upload is a later change.
+- The four "Quick sizes" buttons (landscape, portrait, square, fast) are conveniences that fill width and height. They are not limits.
+- Known limitation: either allowed user can cancel the other's running job (two trusted users; the lock only records a hash of who started it).
+- Local dev: `npm run dev` answers 503 locally (no secrets, no reachable Access JWKS) by design; no bypass exists. Local behaviour is covered by the Vitest suite (`cd ui && npm test`), which mints its own JWTs against a fake JWKS.
+- A warm clip is about 1 to 1.5 minutes; the first clip after idle about 4 to 5 minutes (see the endpoint section).
+
+### Tests
+
+`cd ui && npm test` runs a source guard (no `innerHTML`, no inline script, no secret names in static files, wrangler settings pinned) and the Vitest suite inside workerd (JWT matrix with a fake JWKS, two-user list, CSRF, upload and magic bytes, validation, races, caps, rollback, status mapping, cancel, Range/206/416, gallery pagination, XSS data handling, secrets never logged).
