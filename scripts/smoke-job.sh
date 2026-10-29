@@ -7,13 +7,20 @@
 # Order (cheapest checks first):
 #   1 canary     missing-input i2v job. Needs good R2 secrets, never loads models.
 #   2 cold-tiny  256x256x25 t2v on a cold worker
-#   3 warm-tiny  same job again
+#   3 warm-tiny  another tiny job (new seed); its gen_time_s is the no-model-load baseline
+#   3b repeat-same  the exact same request as warm-tiny again: must COMPLETE with a NEW output key
+#      (ComfyUI caches everything; the worker uses a unique OUTPUT prefix per run so the save node re-runs)
 #   4 warm-def   1280x704x121 @24 fps
+# Every job uses a different seed (SMOKE_SEED_BASE, +1 per job) so none is a cache hit, except repeat-same.
 #   5 warm-def2  same again: must be within 10% of #4 (no encoder eviction / reload)
 #   6 wait for scale to zero, then 7 cold-def: the user's real "first job after idle" path
 # Uses /run + /status + /health + /cancel only (never /runsync: it sits behind a ~100 s edge timeout).
 # The run URL comes from the endpoint's `requestUrls` (GET /serverless/<id>) when present, else RUNPOD_RUN_BASE.
-# Cold start = delayTime + executionTime of a job, minus its gen_time_s.
+# Cold start = worker start + model-load overhead, where
+#   worker start        = delayTime + executionTime - gen_time_s  (queue, worker boot, handler overhead)
+#   model-load overhead = gen_time_s of the cold job - gen_time_s of the matching warm job
+# (the model load runs inside the first job, so it is part of gen_time_s). The 180 s flag and the
+# 600 s hard stop apply to this sum; cold-tiny is compared with warm-tiny, cold-def with warm-def.
 # Canary: passes when the error is "[input_fetch] input not found" (a missing key failing inside input_fetch
 # proves the R2 credentials resolved), with or without a separate error_code field (a missing field is noted).
 # Anything else at the canary stops the gate right there, before any model job runs.
@@ -227,7 +234,7 @@ run_job() {
   J_AUDIO=
   say "    status=$J_STATUS delayTime=${J_DELAY:-?}ms executionTime=${J_EXEC:-?}ms gen_time_s=${J_GEN:-?} cold=${J_COLD:-?} peak_vram_mb=${J_VRAM:-null}"
   if [[ $J_STATUS == COMPLETED ]]; then
-    say "    cold start (delayTime + executionTime - gen_time) = ${J_START:-?} s"
+    say "    worker start (delayTime + executionTime - gen_time; model load is inside gen_time) = ${J_START:-?} s"
     say "    keys: $J_KEY $J_THUMB $J_META"
     if ((R2_CHECK)); then r2_check "$label"; fi
   else
@@ -241,7 +248,7 @@ run_job() {
 
 record_csv() {
   mkdir -p "$(dirname "$CSV")"
-  [[ -f $CSV ]] || echo "utc,label,job_id,status,cold_flag,delay_ms,exec_ms,gen_time_s,cold_start_s,peak_vram_mb,key,audio" >"$CSV"
+  [[ -f $CSV ]] || echo "utc,label,job_id,status,cold_flag,delay_ms,exec_ms,gen_time_s,worker_start_s,peak_vram_mb,key,audio" >"$CSV"
   printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$J_ID" "$J_STATUS" \
     "${J_COLD:-}" "${J_DELAY:-}" "${J_EXEC:-}" "${J_GEN:-}" "${J_START:-}" "${J_VRAM:-}" "${J_KEY:-}" "${J_AUDIO:-}" >>"$CSV"
 }
@@ -253,7 +260,7 @@ r2_check() {
   if [[ $RUNPOD_TEST_MODE == 1 && ${SMOKE_ALLOW_STUB_AWS:-0} != 1 ]]; then
     J_AUDIO=unchecked; NOTES+=("$1: R2 check skipped (test mode, no stub aws)"); say "    R2 check SKIPPED: test mode refuses a real aws/Cloudflare call"; return 0
   fi
-  local k tmp ctype ep=https://${CFG[R2_ACCOUNT_ID]}.r2.cloudflarestorage.com
+  local k tmp ctype probe ep=https://${CFG[R2_ACCOUNT_ID]}.r2.cloudflarestorage.com
   tmp=$(mktemp -d)
   for k in "$J_KEY" "$J_THUMB" "$J_META"; do
     ctype=$(AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
@@ -264,7 +271,10 @@ r2_check() {
   if AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
     aws --endpoint-url "$ep" s3 cp "s3://${CFG[R2_BUCKET]}/$J_KEY" "$tmp/out.mp4" >/dev/null 2>&1; then
     if command -v ffprobe >/dev/null; then
-      if ffprobe -v error -show_entries stream=codec_type,duration -of json "$tmp/out.mp4" 2>/dev/null | grep -q '"codec_type": *"audio"'; then
+      # Capture first, then match in bash. `ffprobe | grep -q` made grep exit at the first match,
+      # ffprobe got SIGPIPE (141) and pipefail turned a clip WITH audio into "MISSING".
+      probe=$(ffprobe -v error -show_entries stream=codec_type,duration -of json "$tmp/out.mp4" 2>/dev/null) || probe=
+      if [[ $probe =~ \"codec_type\":[[:space:]]*\"audio\" ]]; then
         J_AUDIO=yes; say "    audio stream: present"
       else
         J_AUDIO=NO; FAILS+=("$1: no audio stream in the mp4"); say "    audio stream: MISSING"
@@ -276,10 +286,24 @@ r2_check() {
 
 num_gt() { awkf -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
 
-check_cold() { # LABEL: flag > 180 s, stop > 600 s
+# Cold start = worker start + model-load overhead.
+#   worker start       = delayTime + executionTime - gen_time_s   (queue + worker boot + handler overhead)
+#   model-load overhead = gen_time_s of the cold job - gen_time_s of the matching warm job
+# The model load happens INSIDE the first job (ComfyUI loads on the first /prompt), so it is part of
+# gen_time_s; subtracting gen_time_s from delay+exec alone hides it (a real run showed 2.4 s for a ~120 s load).
+cold_report() { # LABEL WORKER_START COLD_GEN WARM_GEN -> COLD_START, notes, flag > 180 s, stop > 600 s
+  local label=$1 start=$2 cgen=$3 wgen=$4 overhead
+  overhead=$(awkf -v c="$cgen" -v w="$wgen" 'BEGIN{o=c-w; if (o<0) o=0; printf "%.1f", o}')
+  COLD_START=$(awkf -v s="$start" -v o="$overhead" 'BEGIN{printf "%.1f", s+o}')
+  say "    $label cold start = worker start ${start} s + model-load overhead ${overhead} s (cold gen ${cgen} s - warm gen ${wgen} s) = ${COLD_START} s"
+  NOTES+=("$label: cold start ${COLD_START} s = worker start ${start} s + model-load overhead ${overhead} s")
+  if num_gt "$COLD_START" "$COLD_HARD_S"; then stop "$label: cold start ${COLD_START}s exceeds the ${COLD_HARD_S}s hard limit."; fi
+  if num_gt "$COLD_START" "$COLD_FLAG_S"; then NOTES+=("$label: cold start ${COLD_START}s > ${COLD_FLAG_S}s (flag; propose mitigations, change nothing)"); fi
+}
+
+check_worker_start() { # LABEL: even before the overhead is known, a worker start alone above the hard limit stops the gate
   [[ -n $J_START ]] || return 0
-  if num_gt "$J_START" "$COLD_HARD_S"; then stop "$1: cold start ${J_START}s exceeds the ${COLD_HARD_S}s hard limit."; fi
-  if num_gt "$J_START" "$COLD_FLAG_S"; then NOTES+=("$1: cold start ${J_START}s > ${COLD_FLAG_S}s (flag; propose mitigations, change nothing)"); fi
+  if num_gt "$J_START" "$COLD_HARD_S"; then stop "$1: worker start ${J_START}s exceeds the ${COLD_HARD_S}s hard limit."; fi
 }
 
 require_completed() { # LABEL
@@ -309,8 +333,15 @@ summary() {
 }
 
 # ---------------------------------------------------------------- the gate
-TINY='{"mode":"t2v","prompt":"a red ball rolls across a wooden table, soft ambient sound","width":256,"height":256,"num_frames":25,"fps":24,"seed":1234}'
-DEF='{"mode":"t2v","prompt":"a red ball rolls across a wooden table in a sunlit room, soft ambient sound","width":1280,"height":704,"num_frames":121,"fps":24,"seed":1234}'
+# A different seed per job (SEED_BASE, SEED_BASE+1, ...) so no job is a ComfyUI cache hit,
+# except the deliberate repeat-same job below.
+SEED_NEXT=${SMOKE_SEED_BASE:-1000}
+TINY_T='{"mode":"t2v","prompt":"a red ball rolls across a wooden table, soft ambient sound","width":256,"height":256,"num_frames":25,"fps":24,"seed":@@SEED@@}'
+DEF_T='{"mode":"t2v","prompt":"a red ball rolls across a wooden table in a sunlit room, soft ambient sound","width":1280,"height":704,"num_frames":121,"fps":24,"seed":@@SEED@@}'
+next_input() { # next_input TEMPLATE -> NEXT_INPUT with a fresh seed
+  NEXT_INPUT=${1//@@SEED@@/$SEED_NEXT}
+  SEED_NEXT=$((SEED_NEXT + 1))
+}
 CANARY='{"mode":"i2v","prompt":"smoke canary","input_key":"inputs/__smoke_missing__.png","width":256,"height":256,"num_frames":25}'
 
 say "gate against endpoint $EP ($EP_URL). Billable: RTX 6000 Ada \$1.75/hr, spend cap \$${MAX_SPEND}."
@@ -330,17 +361,33 @@ else
 fi
 
 # 2 cold tiny
-run_job cold-tiny "$TINY"; require_completed cold-tiny
+next_input "$TINY_T"; TINY_COLD=$NEXT_INPUT
+run_job cold-tiny "$TINY_COLD"; require_completed cold-tiny
 V_COLD_TINY=$J_VRAM
+COLD_TINY_GEN=$J_GEN
+COLD_TINY_START=$J_START
 COLD_TINY_TOTAL=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" 'BEGIN{printf "%.1f",(d+e)/1000}')
-check_cold cold-tiny
+check_worker_start cold-tiny
 [[ $J_COLD == true ]] || NOTES+=("cold-tiny: cold flag was '$J_COLD' (judge cold by delayTime, not by the flag)")
 
-# 3 warm tiny
-run_job warm-tiny "$TINY"; require_completed warm-tiny
+# 3 warm tiny (a new seed: not a cache hit); its gen_time_s is the no-model-load baseline
+next_input "$TINY_T"; TINY_WARM=$NEXT_INPUT
+run_job warm-tiny "$TINY_WARM"; require_completed warm-tiny
+WARM_TINY_KEY=$J_KEY
+cold_report cold-tiny "$COLD_TINY_START" "$COLD_TINY_GEN" "$J_GEN"
+
+# 3b repeat-same: the exact same request again. ComfyUI serves everything from cache; the
+# worker must still produce a NEW output file (unique OUTPUT prefix per run).
+run_job repeat-same "$TINY_WARM"; require_completed repeat-same
+if [[ $J_KEY == "$WARM_TINY_KEY" ]]; then
+  FAILS+=("repeat-same: the repeated request returned the SAME output key as warm-tiny ($J_KEY); expected a new one")
+else
+  say "    repeat-same completed with a new output key ($J_KEY)"
+fi
 
 # 4 warm default
-run_job warm-def "$DEF"; require_completed warm-def
+next_input "$DEF_T"; DEF_WARM=$NEXT_INPUT
+run_job warm-def "$DEF_WARM"; require_completed warm-def
 V_WARM_DEF=$J_VRAM
 GEN1=$J_GEN
 if num_gt "$GEN1" "$WARM_STOP_S"; then stop "warm-def: gen_time_s ${GEN1}s exceeds ${WARM_STOP_S}s."; fi
@@ -350,7 +397,8 @@ if num_gt "$(awkf -v a="$COLD_TINY_TOTAL" -v b="$GEN1" 'BEGIN{print a+b}')" "$SU
 fi
 
 # 5 second warm default: pass test is within 10%
-run_job warm-def2 "$DEF"; require_completed warm-def2
+next_input "$DEF_T"; DEF_WARM2=$NEXT_INPUT
+run_job warm-def2 "$DEF_WARM2"; require_completed warm-def2
 V_WARM_DEF2=$J_VRAM
 if awkf -v a="$GEN1" -v b="$J_GEN" 'BEGIN{d=(b>a)?b-a:a-b; exit !(d<=0.10*a)}'; then
   say "    second warm default job gen_time ${J_GEN}s is within 10% of the first (${GEN1}s)"
@@ -374,9 +422,11 @@ if ((FINAL_COLD)); then
     ((SECONDS - w0 < IDLE_WAIT_S)) || stop "worker did not scale to zero within ${IDLE_WAIT_S}s: idle timeout may not be 60 s; check the endpoint (it is billing)."
     sleep "$POLL_S"
   done
-  run_job cold-def "$DEF"; require_completed cold-def
+  next_input "$DEF_T"; DEF_COLD=$NEXT_INPUT
+  run_job cold-def "$DEF_COLD"; require_completed cold-def
   V_COLD_DEF=$J_VRAM
-  check_cold cold-def
+  check_worker_start cold-def
+  cold_report cold-def "$J_START" "$J_GEN" "$GEN1"
   [[ $J_COLD == true ]] || NOTES+=("cold-def: cold flag was '$J_COLD' (FlashBoot restore or surviving process?); judge by delayTime")
   TOTAL=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" 'BEGIN{printf "%.1f",(d+e)/1000}')
   say "    user path (cold + default clip): ${TOTAL}s of the 780 s generation budget / ${EXEC_S} s execution timeout"
