@@ -326,3 +326,100 @@ Limit by design: on RunPod the guard sees the shared cluster's free space, not t
 ## What still cannot be verified without real calls
 
 Secret substitution at boot; the live endpoint GET shape and `requestUrls`; the real `/health`, `/status` and `/cancel` field names and whether `error_code` appears; GPU pool and type ids; the `cpu3c` id and stock; that the quota behaves as 80 GB on the shared filesystem; real FlashBoot, scaling and billing granularity (the spend figure is an estimate, not a billing read).
+
+---
+
+# Fixes from the first real gate run
+
+Branch `fix/gate-hang-and-df`, commits 72984a3 (handler OUTPUT prefix), 2501902 (download-models SIGPIPE), 954abec (smoke-job audio, cold start, seeds, repeat-same), 5fc6640 (README and decision note), plus 6f5e044 (README wording). No RunPod or Cloudflare call; ComfyUI ran on CPU in the local worker image, the fake server on 127.0.0.1; the real endpoint was not touched. Harnesses (`ct/test.py`, `ct/run.sh`, `ct/ff.sh`, `cold.sh`, `aud.sh`, `curlchk.sh`) are in the job scratch dir, not committed.
+
+## Verdict: ACCEPT
+
+All three real-run defects are fixed and reproduced-then-fixed on real components. I have only low items, none of which blocks merging and rerunning the gate.
+
+## 1. Test runs
+
+| Command | Result |
+|---|---|
+| `make test` | 127 passed |
+| `make -f infra/runpod/infra.mk test-infra` | 389 passed (no shellcheck); 390 passed with shellcheck 0.11 on PATH |
+| `make -f scripts/models.mk test-models` | 96 passed |
+| `make lint` | clean |
+| `make -f scripts/workflows.mk test-workflows` | 1853 checks, 0 failures |
+| `shellcheck -x -e SC1091` on `apply.sh lib.sh smoke-job.sh tests/infra/run.sh download-models.sh tests/models/run.sh` | no findings |
+| `git diff origin/main --stat -- worker` | only `worker/handler.py` (+21/-2) |
+
+## 2. Empirical proof of the ComfyUI cache mechanism (fix b)
+
+Method: the local worker image `ghcr.io/ken-ck-yu/ltx25-worker:dev`, ComfyUI started with `main.py --cpu` (as `wf-in-container.sh` does), the repo's `worker/handler.py` mounted at `/handler` and `workflows/` at `/wf`. The graph is the repo's own probe (PrimitiveInt -> ComfyMathExpression `Half Width` -> EmptyImage -> CreateVideo -> SaveVideo titled `OUTPUT`, nodes copied from `t2v.json`). Each run is submitted to `/prompt`, polled on `/history`, then passed to the real `handler.find_output_mp4`, and the file is deleted afterwards exactly as `run_job`'s `finally` does after an upload. Run via `bash ct/go.sh` (a `docker run --rm --entrypoint /bin/bash` wrapper mounting `ct/`, `ct/handler`, `workflows/`).
+
+Output (trimmed to the facts):
+
+```
+t2v OUTPUT prefix before: ['video/LTX_2.5_t2v_wf1'] after: ['video/LTX_2.5_t2v_wf1_job-abc____def_ghi_34bec843']
+[A1 first run, prefix P]        0.22s success execution_cached=[[]]                  outputs node5 -> video/wf_cache_probe_t2v_wf1_00001_.mp4
+[A1] handler.find_output_mp4 -> /comfyui/output/video/wf_cache_probe_t2v_wf1_00001_.mp4   (cleanup removed it)
+[A2 identical request, prefix P] 0.20s success execution_cached=[['1','2','3','4','5']]  outputs node5 -> the same, now deleted file
+[A2] handler.find_output_mp4 -> JobError output_missing: node OUTPUT produced no mp4     mp4 files now: []
+[A3 identical request again]    0.20s success execution_cached=[['1','2','3','4','5']]   -> JobError output_missing
+[B1 same request, prefix P_jobX_e40470cf] 0.21s success execution_cached=[['1','2','3','4']]  node 5 re-executed
+[B1] handler.find_output_mp4 -> /comfyui/output/video/wf_cache_probe_t2v_wf1_jobX_e40470cf_00001_.mp4  (new file)
+[B2 same request, same job id, new suffix] execution_cached=[['1','2','3','4']] -> new file ..._jobX_6dd7dcf2_00001_.mp4
+ComfyUI log: Prompt executed in 0.04 / 0.00 / 0.00 / 0.04 / 0.04 seconds
+```
+
+Findings from this experiment:
+- The real failure reproduces exactly: with the same prefix, the second request is a full cache hit including the save node (`Prompt executed in 0.00 seconds`, all five nodes cached), ComfyUI's history still names the earlier output file, that file was deleted by the handler's cleanup, and `find_output_mp4` raises `output_missing: node OUTPUT produced no mp4`.
+- With a different prefix suffix only the save node (5) re-executes, the upstream nodes (1 to 4) stay cached, a new mp4 is produced in about 0.2 s, and `find_output_mp4` picks it. A retry with the same job id gets a different suffix (random 8 hex), so it cannot collide.
+- Note on the engineer's unit tests: their fake ComfyUI returns `outputs: {}` for a cache hit, while the real ComfyUI returns the old filename (a now-missing file). Both end in `output_missing` and both are fixed by the same change, so the tests are valid, but the fake is not a faithful model. This probe is the real evidence.
+- The scale is tiny (CPU, 640x64, 9 frames). It proves the cache semantics, not GPU timing. The real model graph keeps the same shape (a single `SaveVideo` titled `OUTPUT`), which the static workflow checks enforce (1853 checks pass).
+
+## 3. Handler change review
+
+- Where applied: `fill_workflow(..., prefix_suffix)` appends `_<suffix>` to the `filename_prefix` of every node titled `OUTPUT` (the loop), after the `..._wfN` marker, so `video/LTX_2.5_t2v_wf1` becomes `video/LTX_2.5_t2v_wf1_<jobid>_<8 hex>`; the `video/` subfolder is preserved (shown above on the real `t2v.json`).
+- Safety and length: the suffix is `safe_id(jid)[:40] + "_" + uuid4 hex[:8]`; `safe_id` replaces anything outside `[A-Za-z0-9_-]` with `_` (tested with `../../etc`, spaces, backslash, 200 characters, empty id), so no path separators or dots from the job id. Resulting prefix is about 70 characters, far below the 255 limit.
+- Retry with the same job id: different random part each run (verified).
+- Output key logic is unchanged: `stem` is built from the date, time and `jid`, not from the file name; `find_output_mp4` still picks the mp4 of the node titled `OUTPUT`; the sidecar and R2 keys are unaffected.
+- Concurrency: the UUID makes concurrent jobs write different files. (The R2 stem still collides if two jobs share a job id and a second, which is pre-existing and not a RunPod case.)
+- Cleanup: `created` includes the mp4 once found and the `finally` removes it; the work directory is removed. No mp4 accumulates on the success path. Pre-existing and unchanged: if generation fails after ComfyUI wrote the mp4 but before `find_output_mp4` (timeout, OOM mid-save, multi-video mismatch), that file is left in `/comfyui/output`. With unique prefixes it is never reused. Low (L-A).
+- `workflow_mismatch` checks unchanged: missing title still raises, `load_workflow` shape checks unchanged; a non-string `filename_prefix` (for example a link) would be silently skipped by the suffix and would keep the cache bug; the shipped workflows use a literal string and the static check pins that. Low (L-B).
+- Tests: four new handler tests (identical request twice, same job id retry, version marker and filename safety, no suffix leaves the prefix alone); 127 pass.
+
+## 4. smoke-job.sh review
+
+- Audio detection: the old pipeline, run 10 times in the worker image on a real AAC 48 kHz stereo clip made with ffmpeg, said "audio" 0 of 10 times; the new capture-then-match code said 10 of 10. On a video-only clip both said 0 of 10 (correct). With stub ffprobe outputs: audio JSON, compact JSON, video only, 3 KB of random bytes, empty, a nonzero exit, a 60 MB output with the audio entry first or last, and a tricky `"audiox"` / comment string: results yes, yes, NO, NO, NO, NO (fail-safe), yes, yes, NO. No pipe is left in that path. There is no timeout around `ffprobe`; a hung ffprobe on a local file would hang the script after the job finished (low, L-C). Audio duration and silence are still not checked (unchanged).
+- Pipeline audit under `set -o pipefail`: I grepped `scripts infra tests worker .github Makefile` for `| grep -q`, `| head`, `| grep -m`, `| awk ... exit`, `| sed ... q`. The engineer fixed all production hits (`curl --help all | grep -q`, `sed | head`, `ffprobe | grep -q`). Remaining hits are in `tests/models/run.sh` (`grep | grep -q` inside `bash -c` strings without pipefail) and the deliberate demonstration of the bug in `tests/infra/run.sh`. I found nothing the engineer missed.
+- download-models.sh: `check_curl` now captures the help text and matches in bash. Under pipefail with real curl 8.16 it passes 5 of 5 times; a curl stub without `--retry-all-errors` dies with "curl too old"; a failing curl dies; a 5 MB help output passes. The `sed | awk 'NR==1'` replacement returns the first Link header and exit codes `0 0 0`. Behaviour unchanged otherwise (96 tests pass).
+- Cold-start metric: worker start = `delayTime + executionTime - gen_time_s`, overhead = cold `gen_time_s` minus the matching warm `gen_time_s` (cold-tiny vs warm-tiny, cold-def vs warm-def), flag at 180 s and stop at 600 s on the sum. Checked with the extracted function: normal (10 + 103 = 113 s), the real run (2.4 + 103 = 105.4 s), warm slower than cold (overhead clipped to 0), equal, over 600 s (stops at 680 s), 361 s (flag note), all zeros. **Weakness (L-D):** an empty, missing, non-numeric or `nan` value is treated as 0 by awk, so a COMPLETED job with a missing `gen_time_s` or `delayTime` prints a plausible but understated cold start (for example `worker start  s ... = 80.0 s`) and the 600 s stop cannot fire; the output shows the empty field but there is no explicit "metric unavailable" note. A negative worker start is accepted. Real RunPod responses normally carry these fields, so this is low. `check_worker_start` still stops on a worker start above 600 s alone (also for non-numeric text, which it prints).
+- Per-job seeds: `SMOKE_SEED_BASE` (default 1000) plus one per job, via `@@SEED@@` templates; the cold-def, warm-def and warm-def2 jobs each get a new seed, so none is a cache hit.
+- `repeat-same`: same input as warm-tiny, must COMPLETE (a FAILED job goes through `require_completed`, which adds a FAIL and ends the gate with exit 1) and must return a different output key. Note the key assertion is nearly vacuous on the real worker: the key stem contains the job id, so two jobs always have different keys; the useful part is that the job completes at all (L-E). Fine as a guard for the observed bug.
+- CSV: the header column `cold_start_s` became `worker_start_s` (the values are the worker-start figure, so the rename is right); an existing CSV with the old header keeps the old header on the first line while new rows use the new meaning (append-only file; no migration).
+- Previous stops and the spend guard: the infra suite (390 tests) still exercises them; the changed `cold_report` call sites sit before the expensive default jobs, and `repeat-same` adds one more job to the spend estimate (idle tail + poll). Default `--max-spend` 3.00 unchanged.
+
+## 5. Hygiene and documentation
+
+- No secrets in the tree (grep for `rpa_`, `hf_...`, `AKIA` is empty); the new commits add none. Nothing under `worker/` changed except the OUTPUT prefix logic in `handler.py` and its tests.
+- README "First real gate run (2026-10-29)": consistent with the code and my checks (canary passed, 125 s cold job, `gen_time_s` 123 s including model load, 39,473 MiB peak, AAC 48 kHz stereo audio, objects in R2). I cannot confirm those run figures without the real run's logs; the AAC and SIGPIPE claims I reproduced locally. The README also states two unexplained observations (workers IDLE/INITIALIZING past the 60 s idle timeout), still open.
+- Stale text: the decision note's "Validator round" bullet still says `--max-spend` default 1.50 USD; the code and README say 3.00 (L-F).
+- I could not confirm that the local `:dev` image contains the new handler (my search was inconclusive); the experiment used the repo's `handler.py` mounted into the image, which is the code under review.
+
+## 6. Low items
+
+L-A leftover mp4 on failure paths (pre-existing); L-B non-literal `filename_prefix` skips the suffix; L-C no timeout around `ffprobe`; L-D missing or non-numeric timing fields silently read as 0 in `cold_report`; L-E `repeat-same` same-key check is weak; L-F stale 1.50 in the decision note.
+
+## Numbered questions
+
+1. L-D: should `cold_report` and the worker-start check treat missing or non-numeric `delayTime`, `executionTime` or `gen_time_s` as "metric unavailable" (note plus FAIL) instead of 0?
+2. L-E: should `repeat-same` also verify something content-based (for example the object's ETag/size differs, or the sidecar `job_id` differs) rather than the key?
+3. L-B: should the handler raise `workflow_mismatch` if an `OUTPUT` node's `filename_prefix` is not a string, instead of silently skipping the suffix?
+4. L-A: add best-effort removal of any mp4 named in the history on failure paths (or a periodic sweep of `/comfyui/output`)?
+5. Update the stale 1.50 in the decision note?
+
+## What must be true before the coordinator merges and reruns the gate
+
+1. The merged code is built by CI into a new `sha-<short>` image (the handler change is in the image; the old image `sha-f637c09` and any image built before 72984a3 still has the cache bug). Set `IMAGE_TAG` to that tag, run `apply.sh preflight` (public package) and then `apply.sh endpoint` so the endpoint carries the new image; read `GET /serverless/{id}` once and confirm `image`, `timeout` 900000, `workers`, and that max workers is restored from the parked 0 to 1 for the gate.
+2. Before spending, resolve or knowingly accept the two unexplained observations (workers staying IDLE/INITIALIZING past the 60 s idle timeout, twice): watch the console Workers page, and rely on the wait-for-scale-to-zero step, which stops the gate if the worker does not scale to zero within `SMOKE_IDLE_WAIT_S` (600 s).
+3. All earlier preconditions still hold (volume populated and verified, balance funded, R2 secrets, `/health` shows 0 workers and nothing queued, `--max-spend` agreed, someone watching the console).
+4. `ffprobe` and `aws` are available on the machine running the gate (or `--no-r2-check` is chosen knowingly).
+5. Expect and record: `repeat-same` completes with a new key; cold start printed as worker start + model-load overhead; audio reported present. If `repeat-same` returns `output_missing`, stop: the image does not contain the fix.
+6. After the run, park the endpoint again (max workers 0) or restore 2 deliberately, and read `/health` to confirm no worker remains.
