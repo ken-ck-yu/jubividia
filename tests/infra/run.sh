@@ -16,7 +16,9 @@ PASS=0
 FAIL=0
 # Hermetic by default: any invocation that forgets to set its own base URL hits a dead
 # loopback port, never a real host.
-export RUNPOD_API_BASE=http://127.0.0.1:9/v1 RUNPOD_RUN_BASE=http://127.0.0.1:9/rt GHCR_BASE=http://127.0.0.1:9
+export RUNPOD_API_BASE=http://127.0.0.1:9/v2 RUNPOD_RUN_BASE=http://127.0.0.1:9/rt GHCR_BASE=http://127.0.0.1:9/ghcr
+# Test mode: lib.sh refuses any URL that is not http://127.0.0.1:* (asserted in section 0b).
+export RUNPOD_TEST_MODE=1
 
 # Sentinels: must never appear in output, argv or temp files.
 S_KEY=SENTINEL_RPKEY_9f3a1c
@@ -47,7 +49,7 @@ pj() { python3 -I -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
 ctl() { "$REAL_CURL" -s "http://127.0.0.1:$PORT/__ctl/$1"; }
 ctl_set() { "$REAL_CURL" -s -X POST -d "$1" "http://127.0.0.1:$PORT/__ctl/set" >/dev/null; }
 ctl_tamper() { "$REAL_CURL" -s -X POST -d "$1" "http://127.0.0.1:$PORT/__ctl/tamper" >/dev/null; }
-writes() { ctl log | pj 'sum(1 for x in d if x["method"] not in ("GET","HEAD") and x["path"].startswith("/v1/"))'; }
+writes() { ctl log | pj 'sum(1 for x in d if x["method"] not in ("GET","HEAD") and x["path"].startswith("/v2/"))'; }
 count_calls() { ctl log | pj "sum(1 for x in d if x['method']=='$1' and x['path'].startswith('$2'))"; }
 state() { ctl state | pj "$1"; }
 
@@ -81,7 +83,7 @@ mkcfg() { # mkcfg [extra lines...]  (later lines win)
 cfgval() { grep -E "^$1=" "$T/config.env" | tail -n1 | cut -d= -f2-; }
 
 A() {
-  CONFIG_ENV="$T/config.env" RUNPOD_API_BASE="http://127.0.0.1:$PORT/v1" GHCR_BASE="http://127.0.0.1:$PORT" \
+  CONFIG_ENV="$T/config.env" RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" GHCR_BASE="http://127.0.0.1:$PORT/ghcr" \
     TMPDIR="$T/tmp" PATH="$SHIM:$PATH" bash "$APPLY" "$@"
 }
 SM() {
@@ -111,7 +113,7 @@ t "api_delete case labels" "endpoint pod secret_hf" "$(sed -n '/^api_delete()/,/
 t "no volume path inside api_delete" 0 "$(sed -n '/^api_delete()/,/^}/p' "$ROOT/infra/runpod/lib.sh" | grep -c 'network-volumes')"
 t "no line deletes a network volume" 0 "$(grep -hE 'network-volumes' "${SHFILES[@]}" | grep -ciE 'delete')"
 t "no api_delete with R2 secret names" 0 "$(grep -hE 'api_delete' "$APPLY" | grep -ciE 'R2_KEY|ltx_r2|volume')"
-t "hf secret delete is guarded by its name" 1 "$(grep -c 'find_ids /secrets "name=\$SECRET_HF"' "$APPLY" | awk '{print ($1>=1)?1:0}')"
+t "hf secret delete is guarded by its name" 1 "$(grep -c 'find_ids /account/secrets "name=\$SECRET_HF"' "$APPLY" | awk '{print ($1>=1)?1:0}')"
 t "smoke never uses /runsync" 0 "$(grep -v '^#' "$SMOKE" | grep -c 'runsync')"
 t "no RunPod/Cloudflare host hardcoded outside defaults" 0 "$(grep -hoE 'https?://[a-z.]*(runpod|cloudflare)[a-z.]*' "$APPLY" "$SMOKE" | wc -l)"
 
@@ -134,6 +136,32 @@ t "write_id keeps other lines" "$before" "$(grep -v -e '^RUNPOD_ENDPOINT_ID=' -e
 t "write_id keeps file mode" 640 "$(stat -c %a "$T/config.env")"
 out=$(CONFIG_ENV="$T/config.env" bash -c ". '$ROOT/infra/runpod/lib.sh'; read_config; write_id HF_TOKEN abc" 2>&1)
 tc "write_id refuses non-id keys" "$out" "refused"
+
+# ---------------------------------------------------------------- 1b. v2 contract and hermetic test mode
+new_fake
+for p in /v1/secrets /v1/endpoints /v1/network-volumes /v1/serverless /secrets /endpoints /network-volumes /v2/secrets /v2/endpoints /v2/account/endpoints; do
+  code=$("$REAL_CURL" -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT$p")
+  t "fake rejects old/wrong route $p" 404 "$code"
+done
+for p in /v2/account/secrets /v2/network-volumes /v2/serverless /v2/pods; do
+  code=$("$REAL_CURL" -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT$p")
+  t "fake serves real route $p" 200 "$code"
+done
+t "fake: missing bearer is 401" 401 "$("$REAL_CURL" -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v2/serverless")"
+t "fake: old volume field dataCenterId rejected" 422 "$("$REAL_CURL" -s -o /dev/null -w '%{http_code}' -X POST -d '{"name":"v","size":80,"dataCenterId":"US-WA-1"}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v2/network-volumes")"
+t "fake: unknown endpoint field rejected" 422 "$("$REAL_CURL" -s -o /dev/null -w '%{http_code}' -X POST -d '{"name":"e","type":"QUEUE","image":"x:y","scaling":{"type":"QUEUE_DELAY","queueDelay":4},"gpu":{"pools":["ADA_48_PRO"]},"networkVolumeId":"v"}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v2/serverless")"
+t "fake: excluded type outside pools is 400" 400 "$("$REAL_CURL" -s -o /dev/null -w '%{http_code}' -X POST -d '{"name":"e","type":"QUEUE","image":"x:y","scaling":{"type":"QUEUE_DELAY","queueDelay":4},"gpu":{"pools":["ADA_48_PRO"],"excludedTypes":["NVIDIA A40"]}}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v2/serverless")"
+t "no hard-coded old base or routes in the tools" 0 "$(grep -hE '/v1|rest\.runpod\.io|[ "](/secrets|/endpoints)' "${SHFILES[@]}" | grep -vc '^[[:space:]]*#')"
+# test mode refuses every non-loopback URL before any request is made
+ctl clearlog >/dev/null
+for spec in "RUNPOD_API_BASE=https://api.runpod.io/v2" "RUNPOD_RUN_BASE=https://api.runpod.ai/v2" "GHCR_BASE=https://ghcr.io"; do
+  out=$(env "$spec" CONFIG_ENV="$T/config.env" bash "$APPLY" status 2>&1); rc=$?
+  t "test mode refuses $spec" 4 "$rc"
+  tc "refusal message for $spec" "$out" "TEST MODE refuses non-loopback"
+done
+out=$(env -u RUNPOD_API_BASE CONFIG_ENV="$T/config.env" bash "$APPLY" status 2>&1); rc=$?
+t "test mode refuses the real default base" 4 "$rc"
+t "refused runs sent no request" 0 "$(ctl log | pj 'len(d)')"
 
 # ---------------------------------------------------------------- 2. image tag validation
 new_fake
@@ -164,7 +192,7 @@ tc "endpoint id written back" "$EP" ep-
 t "secret id written back" 1 "$([[ -n $(cfgval RUNPOD_SECRET_ID_R2_KEY_ID) && -n $(cfgval RUNPOD_SECRET_ID_R2_KEY_SECRET) ]] && echo 1 || echo 0)"
 t "config.env mode stays 600" 600 "$(stat -c %a "$T/config.env")"
 t "volume size" 80 "$(state "d['volumes']['$VOL']['size']")"
-t "volume dc" US-WA-1 "$(state "d['volumes']['$VOL']['dataCenterId']")"
+t "volume dc" US-WA-1 "$(state "d['volumes']['$VOL']['dataCenter']")"
 E="d['endpoints']['$EP']"
 t "ep image" ghcr.io/ken-ck-yu/ltx25-worker:sha-f637c09 "$(state "$E['image']")"
 t "ep flashboot ON explicitly" FLASHBOOT "$(state "$E['flashboot']")"
@@ -180,15 +208,15 @@ t "ep key id is a secret ref" "{{ RUNPOD_SECRET_ltx_r2_access_key_id }}" "$(stat
 t "ep secret is a secret ref" "{{ RUNPOD_SECRET_ltx_r2_secret_access_key }}" "$(state "$E['env']['R2_SECRET_ACCESS_KEY']")"
 t "ep EXEC_TIMEOUT_S tied to timeout" 900 "$(state "$E['env']['EXEC_TIMEOUT_S']")"
 t "two R2 secrets exist" "ltx_r2_access_key_id ltx_r2_secret_access_key" "$(state "' '.join(sorted(s['name'] for s in d['secrets'].values()))")"
-epbody=$(ctl log | pj '[x for x in d if x["method"]=="POST" and x["path"]=="/v1/endpoints"][0]["body"]')
+epbody=$(ctl log | pj '[x for x in d if x["method"]=="POST" and x["path"]=="/v2/serverless"][0]["body"]')
 for s in "${SENTINELS[@]}"; do tn "endpoint create body has no $s" "$epbody" "$s"; done
-secbody=$(ctl log | pj '[x["body"]["value"] for x in d if x["method"]=="POST" and x["path"]=="/v1/secrets"]')
+secbody=$(ctl log | pj '[x["body"]["value"] for x in d if x["method"]=="POST" and x["path"]=="/v2/account/secrets"]')
 tc "secret values are really sent to create-secret" "$secbody" "$S_R2ID"
-t "authorization header always sent" 0 "$(ctl log | pj 'sum(1 for x in d if x["path"].startswith("/v1/") and not x["auth_ok"])')"
+t "authorization header always sent" 0 "$(ctl log | pj 'sum(1 for x in d if x["path"].startswith("/v2/") and not x["auth_ok"])')"
 
-"$REAL_CURL" -s -o /dev/null -X POST -d '{"scaling":{"type":"REQUEST_COUNT"},"workers":{"idleTimeout":60}}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v1/endpoints"
+"$REAL_CURL" -s -o /dev/null -X POST -d '{"name":"trap2","type":"QUEUE","image":"x:y","gpu":{"pools":["ADA_48_PRO"]},"scaling":{"type":"REQUEST_COUNT","requestCount":4},"workers":{"idleTimeout":60}}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v2/serverless"
 t "fake models trap 2 (REQUEST_COUNT + idleTimeout rejected)" 1 "$(ctl state | pj 'len(d["endpoints"])')"
-t "apply create body uses QUEUE_DELAY (never REQUEST_COUNT)" QUEUE_DELAY "$(ctl log | pj '[x for x in d if x["method"]=="POST" and x["path"]=="/v1/endpoints"][0]["body"]["scaling"]["type"]')"
+t "apply create body uses QUEUE_DELAY (never REQUEST_COUNT)" QUEUE_DELAY "$(ctl log | pj '[x for x in d if x["method"]=="POST" and x["path"]=="/v2/serverless"][0]["body"]["scaling"]["type"]')"
 
 # idempotency: second full run does nothing
 ctl clearlog >/dev/null
@@ -210,7 +238,7 @@ A volume --dry-run >/dev/null 2>&1; A secrets --dry-run >/dev/null 2>&1; out=$(A
 t "dry-run (fresh): no writes" 0 "$(writes)"
 t "dry-run (fresh): config.env untouched" "$sum0" "$(cksum <"$T/config.env")"
 tc "dry-run prints the endpoint body" "$out" '"flashboot":"FLASHBOOT"'
-tc "dry-run says would POST" "$out" "would POST /endpoints"
+tc "dry-run says would POST" "$out" "would POST /serverless"
 t "dry-run (fresh): nothing exists" "0 0 0" "$(ctl state | pj '" ".join(str(len(d[k])) for k in ("volumes","secrets","endpoints"))')"
 full_apply
 A pod-up >/dev/null 2>&1
@@ -240,7 +268,7 @@ A endpoint >/dev/null 2>&1
 t "flashboot drift fixed" FLASHBOOT "$(state "$E['flashboot']")"
 t "flashboot fix is a single-field PATCH" "1 flashboot" "$(ctl log | pj '"%d %s" % (sum(1 for x in d if x["method"]=="PATCH"), ",".join(sorted([x for x in d if x["method"]=="PATCH"][0]["body"])))')"
 # trap 3: a naive PATCH clears exclusions (the fake is faithful) ...
-"$REAL_CURL" -s -o /dev/null -X PATCH -d '{"gpu":{"pools":["ADA_48_PRO"]}}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v1/endpoints/$EP"
+"$REAL_CURL" -s -o /dev/null -X PATCH -d '{"gpu":{"pools":["ADA_48_PRO"]}}' -H "Authorization: Bearer $S_KEY" "http://127.0.0.1:$PORT/v2/serverless/$EP"
 t "fake models trap 3 (pools alone clears exclusions)" 0 "$(state "len($E['gpu']['excludedTypes'])")"
 # ... and apply restores them by sending pools and excludedTypes together
 ctl clearlog >/dev/null
@@ -255,7 +283,7 @@ tc "status warns about lowered workers.max" "$out" "WARNING: workers.max is 0"
 A endpoint >/dev/null 2>&1
 t "workers.max restored" 2 "$(state "$E['workers']['max']")"
 # scaling drifted to REQUEST_COUNT
-ctl_tamper "{\"kind\":\"endpoints\",\"id\":\"$EP\",\"patch\":{\"scaling\":{\"type\":\"REQUEST_COUNT\",\"scalerValue\":4}}}"
+ctl_tamper "{\"kind\":\"endpoints\",\"id\":\"$EP\",\"patch\":{\"scaling\":{\"type\":\"REQUEST_COUNT\",\"requestCount\":4},\"workers\":{\"min\":0,\"max\":2}}}"
 A endpoint >/dev/null 2>&1
 t "scaling back to QUEUE_DELAY" QUEUE_DELAY "$(state "$E['scaling']['type']")"
 
@@ -276,7 +304,7 @@ t "timeout mismatch at create is repaired" 0 "$rc"
 EP=$(cfgval RUNPOD_ENDPOINT_ID)
 t "timeout patched to 900000" 900000 "$(state "d['endpoints']['$EP']['timeout']")"
 tc "mismatch is reported" "$out" "field 'timeout' differs"
-t "no DELETE issued" 0 "$(count_calls DELETE /v1)"
+t "no DELETE issued" 0 "$(count_calls DELETE /v2)"
 new_fake
 A volume >/dev/null 2>&1; A secrets >/dev/null 2>&1
 ctl_set '{"timeout_ignored":true,"patch_ignored":"timeout"}'
@@ -284,7 +312,7 @@ out=$(A endpoint 2>&1); rc=$?
 tnz "persistent mismatch exits non-zero" "$rc"
 tc "message says endpoint was not deleted" "$out" "NOT deleted"
 t "endpoint still exists" 1 "$(state 'len(d["endpoints"])')"
-t "no DELETE on persistent mismatch" 0 "$(count_calls DELETE /v1)"
+t "no DELETE on persistent mismatch" 0 "$(count_calls DELETE /v2)"
 
 # ---------------------------------------------------------------- 7. volume rules
 new_fake
@@ -301,8 +329,8 @@ A volume >/dev/null 2>&1
 t "grow works" 120 "$(state "d['volumes']['$VOL']['size']")"
 # two volumes with the same name+DC: stop
 new_fake
-ctl_tamper '{"kind":"volumes","add":{"id":"vol-a","name":"jubividia-ltx-us-wa1","size":80,"dataCenterId":"US-WA-1"}}'
-ctl_tamper '{"kind":"volumes","add":{"id":"vol-b","name":"jubividia-ltx-us-wa1","size":80,"dataCenterId":"US-WA-1"}}'
+ctl_tamper '{"kind":"volumes","add":{"id":"vol-a","name":"jubividia-ltx-us-wa1","size":80,"dataCenter":"US-WA-1","type":"STANDARD"}}'
+ctl_tamper '{"kind":"volumes","add":{"id":"vol-b","name":"jubividia-ltx-us-wa1","size":80,"dataCenter":"US-WA-1","type":"STANDARD"}}'
 out=$(A volume 2>&1); rc=$?
 tnz "ambiguous volume stops" "$rc"; t "ambiguous volume made no writes" 0 "$(writes)"
 # stale id never silently creates
@@ -337,7 +365,7 @@ for badref in HEAD main 0123456 ""; do
   out=$(A pod-up 2>&1); rc=$?
   tnz "GIT_REF '$badref' rejected" "$rc"
 done
-t "bad GIT_REF made no pod/secret writes" 0 "$(count_calls POST /v1/pods)"
+t "bad GIT_REF made no pod/secret writes" 0 "$(count_calls POST /v2/pods)"
 mkcfg "RUNPOD_NETWORK_VOLUME_ID=$(cfgval RUNPOD_NETWORK_VOLUME_ID)" "RUNPOD_POD_IMAGE=ubuntu:latest"
 out=$(A pod-up 2>&1); tnz "pod image :latest rejected" $?
 mkcfg "RUNPOD_NETWORK_VOLUME_ID=$(cfgval RUNPOD_NETWORK_VOLUME_ID)"
@@ -351,24 +379,25 @@ t "pod HF token is a secret ref" "{{ RUNPOD_SECRET_hf_token_tmp }}" "$(state "$P
 t "pod GIT_REF env" "$REF" "$(state "$P['env']['GIT_REF']")"
 t "pod mounts the volume at /runpod-volume" "/runpod-volume" "$(state "$P['mounts']['network'][0]['path']")"
 t "pod is a secure CPU pod" "SECURE cpu3c" "$(state "$P['cloud'] + ' ' + $P['cpu']['id']")"
-cmdtxt=$(state "$P['cmd'][2]")
+t "pod uses entrypoint+cmd exec form" "bash -c" "$(state "' '.join($P['entrypoint'])")"
+cmdtxt=$(state "$P['cmd'][0]")
 tc "pod script checks out the pinned ref" "$cmdtxt" 'git checkout --detach "$GIT_REF"'
 tn "pod script has no shallow HEAD clone" "$cmdtxt" "--depth 1"
 tc "pod script verifies" "$cmdtxt" "download-models.sh --verify"
 t "hf secret exists" 1 "$(state 'sum(1 for s in d["secrets"].values() if s["name"]=="hf_token_tmp")')"
-podbody=$(ctl log | pj '[x for x in d if x["method"]=="POST" and x["path"]=="/v1/pods"][0]["body"]')
+podbody=$(ctl log | pj '[x for x in d if x["method"]=="POST" and x["path"]=="/v2/pods"][0]["body"]')
 tn "pod create body has no HF token" "$podbody" "$S_HF"
 out=$(A pod-up 2>&1); tnz "second pod-up refused" $?
 tc "refusal names the existing pod" "$out" "already exists"
 # an unrelated pod must never be touched
-ctl_tamper '{"kind":"pods","add":{"id":"pod-other","name":"someone-elses-pod","desiredStatus":"RUNNING"}}'
+ctl_tamper '{"kind":"pods","add":{"id":"pod-other","name":"someone-elses-pod","status":"RUNNING"}}'
 VOLB=$(state 'len(d["volumes"])')
 HFID=$(state '[k for k,s in d["secrets"].items() if s["name"]=="hf_token_tmp"][0]')
 ctl clearlog >/dev/null
 out=$(A pod-down 2>&1); rc=$?
 t "pod-down ok" 0 "$rc"
 t "only the tmp pod deleted" "pod-other" "$(state "','.join(d['pods'])")"
-t "DELETEs issued" "/v1/pods/$POD /v1/secrets/$HFID" "$(ctl log | pj '" ".join(x["path"] for x in d if x["method"]=="DELETE")')"
+t "DELETEs issued" "/v2/pods/$POD /v2/account/secrets/$HFID" "$(ctl log | pj '" ".join(x["path"] for x in d if x["method"]=="DELETE")')"
 t "hf secret gone" 0 "$(state 'sum(1 for s in d["secrets"].values() if s["name"]=="hf_token_tmp")')"
 t "R2 secrets survive pod-down" 2 "$(state 'sum(1 for s in d["secrets"].values() if s["name"].startswith("ltx_r2"))')"
 t "volume survives pod-down" "$VOLB" "$(state 'len(d["volumes"])')"
@@ -376,7 +405,7 @@ t "pod id cleared in config" "" "$(cfgval RUNPOD_POD_ID)"
 tc "pod-down says rotate the token" "$out" "rotate"
 ctl clearlog >/dev/null
 A pod-down >/dev/null 2>&1; t "pod-down is idempotent" 0 $?
-t "second pod-down deletes nothing" 0 "$(count_calls DELETE /v1)"
+t "second pod-down deletes nothing" 0 "$(count_calls DELETE /v2)"
 A pod-logs >/dev/null 2>&1; tnz "pod-logs without a pod fails" $?
 
 # ---------------------------------------------------------------- 10. teardown
@@ -409,7 +438,7 @@ ctl_set '{"leak_on_error":true}'
 A secrets >"$T/leak.out" 2>&1; tnz "leaky server error -> failure" $?
 tc "error output is redacted" "$(cat "$T/leak.out")" "***"
 # wrong key -> 401, key not echoed
-CONFIG_ENV="$T/config.env" RUNPOD_API_BASE="http://127.0.0.1:$PORT/v1" bash "$APPLY" status >"$T/bad.out" 2>&1
+CONFIG_ENV="$T/config.env" RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" bash "$APPLY" status >"$T/bad.out" 2>&1
 mkcfg "RUNPOD_API_KEY=SENTINEL_WRONGKEY_aa11"
 A status >>"$T/bad.out" 2>&1
 for s in "${SENTINELS[@]}" SENTINEL_WRONGKEY_aa11; do
@@ -419,7 +448,7 @@ for s in "${SENTINELS[@]}" SENTINEL_WRONGKEY_aa11; do
 done
 # bash -x is refused, and prints nothing sensitive
 mkcfg
-out=$(CONFIG_ENV="$T/config.env" RUNPOD_API_BASE="http://127.0.0.1:$PORT/v1" bash -x "$APPLY" status 2>&1); rc=$?
+out=$(CONFIG_ENV="$T/config.env" RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" bash -x "$APPLY" status 2>&1); rc=$?
 t "bash -x refused" 2 "$rc"
 tc "bash -x refusal message" "$out" "refusing to run under bash -x"
 for s in "${SENTINELS[@]}"; do tn "bash -x output has no $s" "$out" "$s"; done
@@ -493,6 +522,9 @@ new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
 out=$(FAKE_NO_AUDIO=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
 t "silent mp4 (no audio stream) fails the gate" 1 "$rc"; tc "no audio message" "$out" "no audio stream"
 for s in "${SENTINELS[@]}"; do tn "R2 gate output has no $s" "$out" "$s"; done
+
+# ---------------------------------------------------------------- 12b. nothing ever left the machine
+t "no curl in this run named a non-loopback host" 0 "$(grep -E 'https?://' "$T/argv.log" | grep -vc 'http://127.0.0.1')"
 
 # ---------------------------------------------------------------- 13. worker env contract
 t "handler default equals config default" 1 "$(grep -c 'PLATFORM_LIMIT_S = int(os.environ.get("EXEC_TIMEOUT_S", "900"))' "$ROOT/worker/handler.py")"

@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""Fake RunPod REST + serverless runtime + GHCR for the offline infra tests.
+"""Fake RunPod v2 API + serverless runtime + GHCR for the offline infra tests.
 
-Listens on 127.0.0.1 only. It reproduces the three REST traps from the design note:
-  1. flashboot defaults to OFF when the create body omits it,
-  2. idleTimeout is rejected with REQUEST_COUNT scaling,
-  3. a PATCH that sends gpu.pools without gpu.excludedTypes clears the exclusions.
-Control (no auth): GET /__ctl/log, GET /__ctl/state, POST /__ctl/set, POST /__ctl/tamper.
-Management API under /v1, serverless runtime under /rt/<endpoint>, GHCR under /token and /v2.
+Listens on 127.0.0.1 only. The management API follows RunPod's public v2 OpenAPI document
+(server https://api.runpod.io, every route under /v2): /v2/account/secrets, /v2/network-volumes,
+/v2/serverless, /v2/pods. Anything else (/v1/..., /secrets, /endpoints, ...) is a 404, so the
+earlier wrong-route mistake can not come back unnoticed.
+
+Reproduces the spec's traps: flashboot defaults to OFF; idleTimeout is rejected with REQUEST_COUNT
+scaling; a PATCH that sends gpu.pools without gpu.excludedTypes clears the exclusions; excludedTypes
+without pools on PATCH is a 400; an exclusion outside the pools is a 400; unknown body fields are
+rejected (additionalProperties/unevaluatedProperties false); lists are wrapped
+({"secrets":[..]}, {"networkVolumes":[..],"pagination":..}, {"endpoints":..}, {"pods":..}).
+
+Control (no auth): GET /__ctl/log, /__ctl/state, /__ctl/clearlog; POST /__ctl/set, /__ctl/tamper.
+Serverless runtime under /rt/<endpoint>, GHCR under /ghcr.
 """
 import copy
 import json
 import os
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,6 +30,25 @@ S = {
     "n": 0, "flags": {}, "jobs": {}, "completed": 0, "health_calls_after_done": None,
     "cold_next": True, "default_runs": 0,
 }
+POOLS = {
+    "ADA_48_PRO": ["NVIDIA RTX 6000 Ada Generation", "NVIDIA L40", "NVIDIA L40S",
+                   "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"],
+    "AMPERE_48": ["NVIDIA A40", "NVIDIA RTX A6000"],
+}
+CONTAINER = {"args", "cmd", "entrypoint", "disk", "env", "image", "ports", "registry"}
+EP_CREATE = CONTAINER | {"name", "type", "scaling", "gpu", "cpu", "dataCenterIds", "flashboot",
+                         "networkVolumes", "mounts", "templateId", "timeout", "workers"}
+EP_PATCH = CONTAINER | {"name", "scaling", "gpu", "cpu", "dataCenterIds", "flashboot",
+                        "networkVolumes", "mounts", "templateId", "timeout", "workers"}
+POD_CREATE = CONTAINER | {"name", "cloud", "cpu", "dataCenterIds", "globalNetworking", "gpu",
+                          "mounts", "startJupyter", "startSsh", "templateId"}
+SECRET_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-/]*$")
+CUDA = re.compile(r"^\d+\.\d+$")
+
+
+class Reject(Exception):
+    def __init__(self, code, detail):
+        self.code, self.detail = code, detail
 
 
 def new_id(prefix):
@@ -35,18 +62,102 @@ def merge(old, new):
     return out
 
 
+def need(cond, code, detail):
+    if not cond:
+        raise Reject(code, detail)
+
+
+def only_keys(obj, allowed, what):
+    need(isinstance(obj, dict), 422, f"{what} must be an object")
+    extra = set(obj) - set(allowed)
+    need(not extra, 422, f"{what}: unknown field(s) {sorted(extra)}")
+
+
+# ---------------------------------------------------------------- validators
+def check_workers(w):
+    only_keys(w, {"min", "max", "idleTimeout"}, "workers")
+    for k in ("min", "max"):
+        need(k not in w or (isinstance(w[k], int) and w[k] >= 0), 422, f"workers.{k}")
+    if "idleTimeout" in w:
+        need(isinstance(w["idleTimeout"], int) and 1 <= w["idleTimeout"] <= 3600, 422, "workers.idleTimeout")
+
+
+def check_scaling(s):
+    need(isinstance(s, dict), 422, "scaling")
+    if s.get("type") == "QUEUE_DELAY":
+        only_keys(s, {"type", "queueDelay"}, "scaling")
+        need(isinstance(s.get("queueDelay"), (int, float)) and s["queueDelay"] >= 0.5, 422, "scaling.queueDelay")
+    elif s.get("type") == "REQUEST_COUNT":
+        only_keys(s, {"type", "requestCount"}, "scaling")
+        need(isinstance(s.get("requestCount"), int) and s["requestCount"] >= 1, 422, "scaling.requestCount")
+    else:
+        raise Reject(422, "scaling.type must be QUEUE_DELAY or REQUEST_COUNT")
+
+
+def check_mounts(m):
+    only_keys(m, {"network", "global"}, "mounts")
+    for kind in ("network", "global"):
+        for it in m.get(kind, []):
+            only_keys(it, {"volumeId"}, f"mounts.{kind}[]")
+            need(isinstance(it.get("volumeId"), str), 422, "mounts volumeId")
+            if kind == "network":
+                need(it["volumeId"] in S["volumes"], 400, "unknown network volume")
+
+
+def pool_types(pools):
+    types = set()
+    for p in pools:
+        need(p in POOLS, 400, f"unknown pool {p}")
+        types |= set(POOLS[p])
+    return types
+
+
+def check_gpu(g, create, existing):
+    only_keys(g, {"pools", "excludedTypes", "count", "allowedCudaVersions", "minCudaVersion"}, "gpu")
+    if create:
+        need("pools" in g, 422, "gpu.pools is required on create")
+    need("pools" not in g or (isinstance(g["pools"], list) and g["pools"]), 422, "gpu.pools")
+    if "excludedTypes" in g:
+        need("pools" in g or create, 400, "gpu.excludedTypes requires gpu.pools on PATCH")
+        types = pool_types(g["pools"])
+        for t in g["excludedTypes"]:
+            need(t.strip() in types, 400, f"excluded type {t!r} is not in the selected pools")
+        need(len(set(t.strip() for t in g["excludedTypes"])) == len(g["excludedTypes"]), 422, "excludedTypes unique")
+    elif "pools" in g:
+        pool_types(g["pools"])
+    if g.get("minCudaVersion") not in (None, ""):
+        need(isinstance(g["minCudaVersion"], str) and CUDA.match(g["minCudaVersion"]), 422, "minCudaVersion")
+    for v in g.get("allowedCudaVersions", []):
+        need(CUDA.match(v), 422, "allowedCudaVersions")
+    allowed = g.get("allowedCudaVersions", None if create else existing.get("allowedCudaVersions", []))
+    floor = g.get("minCudaVersion", None if create else existing.get("minCudaVersion"))
+    need(not (allowed and floor), 400, "allowedCudaVersions and minCudaVersion are mutually exclusive")
+
+
+def check_container(b):
+    need(b.get("entrypoint") is None or isinstance(b["entrypoint"], list), 422, "entrypoint must be an array")
+    need(b.get("cmd") is None or isinstance(b["cmd"], list), 422, "cmd must be an array")
+    need(b.get("env") is None or all(isinstance(v, str) for v in b["env"].values()), 422, "env values are strings")
+    need(b.get("disk") is None or (isinstance(b["disk"], int) and b["disk"] >= 1), 422, "disk")
+
+
+# ---------------------------------------------------------------- HTTP
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send(self, code, obj=None, raw=None):
+    def send(self, code, obj=None, raw=None, ctype="application/json"):
         data = raw if raw is not None else (json.dumps(obj).encode() if obj is not None else b"")
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        if data:
+            self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
+
+    def problem(self, code, detail):
+        self.send(code, {"title": "error", "status": code, "detail": detail}, ctype="application/problem+json")
 
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -58,25 +169,28 @@ class H(BaseHTTPRequestHandler):
 
     def handle_any(self):
         path = self.path.split("?")[0]
+        query = self.path.partition("?")[2]
         b = self.body()
         with LOCK:
             if path.startswith("/__ctl/"):
                 return self.ctl(path, b)
-            if path == "/token":
+            if path == "/ghcr/token":
                 return self.send(200, {"token": "anon"})
-            if path.startswith("/v2/") and "/manifests/" in path:
-                tag = path.rsplit("/", 1)[1]
-                return self.send(200 if tag.startswith("sha-") else 404, {})
+            if path.startswith("/ghcr/v2/") and "/manifests/" in path:
+                return self.send(200 if path.rsplit("/", 1)[1].startswith("sha-") else 404, {})
             auth_ok = self.headers.get("Authorization") == f"Bearer {KEY}"
-            S["log"].append({"method": self.command, "path": path, "body": b, "auth_ok": auth_ok,
-                             "has_auth": bool(self.headers.get("Authorization"))})
+            S["log"].append({"method": self.command, "path": path, "query": query, "body": b,
+                             "auth_ok": auth_ok, "has_auth": bool(self.headers.get("Authorization"))})
             if not auth_ok:
-                return self.send(401, {"error": "unauthorized"})
-            if path.startswith("/rt/"):
-                return self.runtime(path, b)
-            if path.startswith("/v1/"):
-                return self.mgmt(path[3:], b)
-            return self.send(404, {"error": "no route"})
+                return self.problem(401, "missing or invalid bearer token")
+            try:
+                if path.startswith("/rt/"):
+                    return self.runtime(path, b)
+                if path.startswith("/v2/"):
+                    return self.mgmt(path[3:], query, b)
+            except Reject as r:
+                return self.problem(r.code, r.detail)
+            return self.problem(404, "no such route")
 
     do_GET = do_POST = do_PATCH = do_DELETE = do_PUT = do_HEAD = handle_any
 
@@ -102,26 +216,38 @@ class H(BaseHTTPRequestHandler):
         return self.send(404, {})
 
     # ------------------------------------------------------------ management
-    def mgmt(self, path, b):
+    def mgmt(self, path, query, b):
         m = self.command
         parts = [p for p in path.split("/") if p]
-        kind = parts[0] if parts else ""
-        coll = {"network-volumes": "volumes", "secrets": "secrets", "endpoints": "endpoints",
-                "pods": "pods"}.get(kind)
-        if not coll:
-            return self.send(404, {"error": "unknown collection"})
+        if parts[:2] == ["account", "secrets"]:
+            coll, parts = "secrets", parts[1:]
+        else:
+            coll = {"network-volumes": "volumes", "serverless": "endpoints", "pods": "pods"}.get(
+                parts[0] if parts else "")
+        if not coll or (coll == "secrets" and parts[0] != "secrets"):
+            return self.problem(404, "no such route")
         items = S[coll]
+        wrap = {"volumes": "networkVolumes", "secrets": "secrets", "endpoints": "endpoints", "pods": "pods"}[coll]
         if len(parts) == 1:
             if m == "GET":
-                return self.send(200, [self.public(coll, x) for x in items.values()])
+                rows = [self.public(coll, x) for x in items.values()]
+                if coll == "secrets" and "name=" in query:
+                    want = query.split("name=")[1].split("&")[0].lower()
+                    rows = [r for r in rows if r["name"].lower() == want]
+                out = {wrap: rows}
+                if coll != "secrets":
+                    out["pagination"] = {"nextCursor": None, "hasNextPage": False}
+                return self.send(200, out)
             if m == "POST":
                 return self.create(coll, b)
-            return self.send(405, {})
+            return self.problem(405, "method not allowed")
         rid = parts[1]
         if rid not in items:
-            return self.send(404, {"error": "not found"})
-        if len(parts) == 3 and parts[2] == "logs" and coll == "pods":
-            return self.send(200, raw=b"\"download ok\\nMODELS DONE\"")
+            return self.problem(404, "not found")
+        if len(parts) == 3 and parts[2] == "logs" and coll == "pods" and m == "GET":
+            return self.send(200, raw=b"data: download ok\n\ndata: MODELS DONE\n\n", ctype="text/event-stream")
+        if len(parts) != 2:
+            return self.problem(404, "no such route")
         if m == "GET":
             return self.send(200, self.public(coll, items[rid]))
         if m == "DELETE":
@@ -129,7 +255,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(204)
         if m == "PATCH":
             return self.patch(coll, rid, b)
-        return self.send(405, {})
+        return self.problem(405, "method not allowed")
 
     @staticmethod
     def public(coll, x):
@@ -138,61 +264,160 @@ class H(BaseHTTPRequestHandler):
         return x
 
     def create(self, coll, b):
-        if not isinstance(b, dict) or "__bad_json__" in b:
-            return self.send(400, {"error": "bad json"})
+        need(isinstance(b, dict) and "__bad_json__" not in b, 400, "bad json")
         items = S[coll]
-        if coll == "secrets" and S["flags"].get("leak_on_error"):
-            return self.send(400, {"error": "bad secret " + json.dumps(b)})
         if coll == "secrets":
-            if any(s["name"] == b.get("name") for s in items.values()):
-                return self.send(409, {"error": "name exists"})
+            if S["flags"].get("leak_on_error"):
+                return self.problem(400, "bad secret " + json.dumps(b))
+            only_keys(b, {"name", "value", "description"}, "secret")
+            need(isinstance(b.get("name"), str) and SECRET_NAME.match(b["name"]), 422, "secret name pattern")
+            need(isinstance(b.get("value"), str) and b["value"], 422, "secret value")
+            need(not any(s["name"] == b["name"] for s in items.values()), 409, "A secret with this name already exists.")
             rid = new_id("sec")
-            items[rid] = {"id": rid, "name": b["name"], "value": b["value"]}
+            items[rid] = {"id": rid, "name": b["name"], "value": b["value"], "createdAt": "2026-10-29T00:00:00Z",
+                          "valueLastUpdatedAt": "2026-10-29T00:00:00Z"}
         elif coll == "volumes":
+            only_keys(b, {"name", "size", "dataCenter", "type"}, "volume")
+            for k in ("name", "size", "dataCenter"):
+                need(k in b, 422, f"{k} is required")
+            need(isinstance(b["size"], int) and 10 <= b["size"] <= 4096, 422, "size 10..4096")
+            need(b.get("type", "STANDARD") in ("STANDARD", "HIGH_PERFORMANCE"), 422, "type")
             rid = new_id("vol")
-            items[rid] = {"id": rid, "name": b["name"], "size": b["size"],
-                          "dataCenterId": b["dataCenterId"]}
+            items[rid] = {"id": rid, "name": b["name"], "size": b["size"], "dataCenter": b["dataCenter"],
+                          "type": b.get("type", "STANDARD")}
         elif coll == "endpoints":
-            if b.get("scaling", {}).get("type") == "REQUEST_COUNT" and "idleTimeout" in b.get("workers", {}):
-                return self.send(400, {"error": "idleTimeout is not allowed with REQUEST_COUNT scaling"})
-            rid = new_id("ep")
-            e = copy.deepcopy(b)
-            e["id"] = rid
-            e.setdefault("flashboot", "OFF")            # trap 1
-            e.setdefault("timeout", 300000)
-            if S["flags"].get("timeout_ignored"):
-                e["timeout"] = 300000
-            items[rid] = e
+            rid = self.create_endpoint(b)
         else:
-            rid = new_id("pod")
-            items[rid] = dict(copy.deepcopy(b), id=rid, desiredStatus="RUNNING")
-        out = self.public(coll, items[rid])
-        return self.send(201, out)
+            rid = self.create_pod(b)
+        return self.send(201, self.public(coll, items[rid]))
+
+    def create_endpoint(self, b):
+        only_keys(b, EP_CREATE, "endpoint")
+        for k in ("name", "type", "scaling"):
+            need(k in b, 422, f"{k} is required")
+        need(b["type"] in ("QUEUE", "LOAD_BALANCER"), 422, "type")
+        need("image" in b or "templateId" in b, 422, "image is required")
+        need(("gpu" in b) != ("cpu" in b), 400, "specify exactly one of gpu or cpu")
+        check_container(b)
+        check_scaling(b["scaling"])
+        if "gpu" in b:
+            check_gpu(b["gpu"], True, {})
+        if "workers" in b:
+            check_workers(b["workers"])
+        if "mounts" in b:
+            check_mounts(b["mounts"])
+        need("timeout" not in b or isinstance(b["timeout"], int), 422, "timeout must be an integer")
+        need(b.get("flashboot", "OFF") in ("OFF", "FLASHBOOT", "PRIORITY_FLASHBOOT"), 422, "flashboot")
+        need(not (b["scaling"]["type"] == "REQUEST_COUNT" and "idleTimeout" in b.get("workers", {})), 400,
+             "workers.idleTimeout is not applicable to REQUEST_COUNT scaling")
+        rid = new_id("ep")
+        e = {k: copy.deepcopy(v) for k, v in b.items() if k not in ("gpu", "workers", "mounts")}
+        e["id"] = rid
+        e["flashboot"] = b.get("flashboot", "OFF")                    # trap: default OFF
+        e["timeout"] = 300000 if S["flags"].get("timeout_ignored") else b.get("timeout", 300000)
+        w = {"min": 0, "max": 3, "idleTimeout": 10}
+        w.update(b.get("workers", {}))
+        if b["scaling"]["type"] == "REQUEST_COUNT":
+            w.pop("idleTimeout")
+        e["workers"] = w
+        if "gpu" in b:
+            g = b["gpu"]
+            e["gpu"] = {"pools": g["pools"], "excludedTypes": [t.strip() for t in g.get("excludedTypes", [])],
+                        "count": g.get("count", 1), "allowedCudaVersions": g.get("allowedCudaVersions", []),
+                        "minCudaVersion": g.get("minCudaVersion") or None}
+        e["dataCenterIds"] = b.get("dataCenterIds", [])
+        net = b.get("mounts", {}).get("network", [])
+        e["mounts"] = {"network": net, "global": b.get("mounts", {}).get("global", [])}
+        e["networkVolumes"] = [m["volumeId"] for m in net]
+        e["createdAt"] = "2026-10-29T00:00:00Z"
+        S["endpoints"][rid] = e
+        return rid
+
+    def create_pod(self, b):
+        only_keys(b, POD_CREATE, "pod")
+        need("name" in b and b["name"], 422, "name is required")
+        need("image" in b or "templateId" in b, 422, "image is required")
+        need(("gpu" in b) != ("cpu" in b), 400, "exactly one of gpu or cpu must be set")
+        check_container(b)
+        if "cpu" in b:
+            only_keys(b["cpu"], {"id", "vcpuCount"}, "cpu")
+            need(isinstance(b["cpu"].get("vcpuCount"), int) and b["cpu"]["vcpuCount"] >= 2, 422, "vcpuCount >= 2")
+            need(b["cpu"].get("id"), 422, "cpu.id")
+        need(b.get("cloud", "SECURE") in ("SECURE", "COMMUNITY"), 422, "cloud")
+        m = b.get("mounts", {})
+        only_keys(m, {"persistent", "network", "global"}, "mounts")
+        need(not ("cpu" in b and "persistent" in m), 400, "mounts.persistent is invalid for CPU pods")
+        for it in m.get("network", []):
+            only_keys(it, {"volumeId", "path"}, "mounts.network[]")
+            need(it.get("path"), 422, "network mount path is required")
+            need(it.get("volumeId") in S["volumes"], 400, "unknown network volume")
+        rid = new_id("pod")
+        p = copy.deepcopy(b)
+        p.update({"id": rid, "status": "RUNNING", "cloud": b.get("cloud", "SECURE"), "env": b.get("env", {}),
+                  "ports": b.get("ports", []), "dataCenterId": (b.get("dataCenterIds") or [None])[0]})
+        if "cpu" in p:
+            p["cpu"]["memory"] = 4
+        S["pods"][rid] = p
+        return rid
 
     def patch(self, coll, rid, b):
+        need(isinstance(b, dict) and "__bad_json__" not in b and b, 422, "empty or invalid body")
         x = S[coll][rid]
         if coll == "volumes":
-            if b.get("size", x["size"]) < x["size"]:
-                return self.send(400, {"error": "cannot shrink"})
+            only_keys(b, {"name", "size"}, "volume")
+            need(b.get("size", x["size"]) >= x["size"], 400, "size decrease attempted")
+            need(isinstance(b.get("size", 10), int) and b.get("size", 10) <= 4096, 422, "size")
             x.update(b)
         elif coll == "secrets":
-            x["value"] = b["value"]
+            only_keys(b, {"value", "description"}, "secret")
+            need(b.get("value", "x"), 422, "value")
+            if "value" in b:
+                x["value"] = b["value"]
         elif coll == "endpoints":
-            if b.get("scaling", {}).get("type") == "REQUEST_COUNT" and "idleTimeout" in (b.get("workers") or x.get("workers", {})):
-                return self.send(400, {"error": "idleTimeout is not allowed with REQUEST_COUNT scaling"})
-            for k, v in b.items():
-                if k == "gpu":
-                    g = merge(x.get("gpu", {}), v)
-                    if "excludedTypes" not in v:
-                        g["excludedTypes"] = []          # trap 3
-                    x["gpu"] = g
-                elif k in ("workers", "scaling") and isinstance(v, dict):
-                    x[k] = merge(x.get(k, {}), v)
-                elif k == S["flags"].get("patch_ignored"):
-                    continue
-                else:
-                    x[k] = copy.deepcopy(v)
+            self.patch_endpoint(x, b)
+        else:
+            return self.problem(405, "pod PATCH not used by this tool")
         return self.send(200, self.public(coll, x))
+
+    def patch_endpoint(self, x, b):
+        only_keys(b, EP_PATCH, "endpoint patch")
+        check_container(b)
+        if "scaling" in b:
+            check_scaling(b["scaling"])
+        if "workers" in b:
+            check_workers(b["workers"])
+        if "mounts" in b:
+            check_mounts(b["mounts"])
+        if "gpu" in b:
+            check_gpu(b["gpu"], False, x.get("gpu", {}))
+        scaling = b.get("scaling", x["scaling"])
+        need(not (scaling["type"] == "REQUEST_COUNT" and "idleTimeout" in b.get("workers", {})), 400,
+             "workers.idleTimeout is not applicable to REQUEST_COUNT scaling")
+        for k, v in b.items():
+            if k == S["flags"].get("patch_ignored"):
+                continue
+            if k == "gpu":
+                g = copy.deepcopy(x["gpu"])
+                if "pools" in v:
+                    g["pools"] = v["pools"]
+                    g["excludedTypes"] = [t.strip() for t in v.get("excludedTypes", [])]   # trap: cleared
+                for f in ("count", "allowedCudaVersions"):
+                    if f in v:
+                        g[f] = v[f]
+                if "minCudaVersion" in v:
+                    g["minCudaVersion"] = v["minCudaVersion"] or None
+                x["gpu"] = g
+            elif k == "workers":
+                x["workers"] = merge(x["workers"], v)
+            elif k == "mounts":
+                for kind in ("network", "global"):
+                    if kind in v:
+                        x["mounts"][kind] = v[kind]
+                x["networkVolumes"] = [m["volumeId"] for m in x["mounts"]["network"]]
+            else:
+                x[k] = copy.deepcopy(v)
+        if x["scaling"]["type"] == "REQUEST_COUNT":
+            x["workers"].pop("idleTimeout", None)
 
     # ------------------------------------------------------------ runtime
     def runtime(self, path, b):
