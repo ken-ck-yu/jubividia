@@ -9,6 +9,7 @@ export PYTHONDONTWRITEBYTECODE=1
 mkdir -p /comfyui/input
 ffmpeg -loglevel error -y -f lavfi -i color=c=blue:s=320x240:d=1 -frames:v 1 /comfyui/input/wf_sample.png
 ffmpeg -loglevel error -y -f lavfi -i testsrc=s=320x240:r=24:d=3 -c:v libx264 -pix_fmt yuv420p /comfyui/input/wf_sample.mp4
+ffmpeg -loglevel error -y -f lavfi -i testsrc=s=320x240:r=24 -frames:v 12 -c:v libx264 -pix_fmt yuv420p /comfyui/input/wf_short.mp4
 
 cd /comfyui || exit 2
 $PY main.py --cpu --listen 127.0.0.1 --port 8188 > /tmp/comfyui.log 2>&1 &

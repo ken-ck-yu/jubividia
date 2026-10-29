@@ -102,7 +102,99 @@ def readme_version(path):
     return int(m.group(1)) if m else None
 
 
+# Output slot counts of every class used (from the worker image's /object_info).
+# Live mode checks the same against the real /object_info.
+SLOTS = {
+    "UNETLoader": 1, "VAELoader": 1, "CLIPLoader": 1, "LatentUpscaleModelLoader": 1,
+    "PrimitiveInt": 1, "PrimitiveFloat": 1, "CLIPTextEncode": 1, "LTXVConditioning": 2,
+    "LoadImage": 2, "ImageScale": 1, "LTXVPreprocess": 1, "LoadVideo": 1, "Video Slice": 1,
+    "GetVideoComponents": 5, "ImageFromBatch": 1, "ComfyMathExpression": 3,
+    "EmptyLTXVLatentVideo": 1, "LTXVImgToVideoInplace": 1, "LTXVAddGuide": 3,
+    "LTXVEmptyLatentAudio": 1, "LTXVConcatAVLatent": 1, "LTXVDualCFGGuider": 1,
+    "RandomNoise": 1, "KSamplerSelect": 1, "ManualSigmas": 1, "SamplerCustomAdvanced": 2,
+    "LTXVSeparateAVLatent": 2, "LTXVCropGuides": 3, "LTXVLatentUpsampler": 1,
+    "VAEDecodeTiled": 1, "LTXVAudioVAEDecode": 1, "CreateVideo": 1, "SaveVideo": 1,
+}
+# Pinned literals (independent copy of what the Comfy-Org templates use).
+SIGMAS_STAGE1 = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+SIGMAS_STAGE2 = "0.85, 0.7250, 0.4219, 0.0"
+PINS = [  # class_type, input, expected
+    ("CLIPLoader", "type", "ltxv"),
+    ("UNETLoader", "weight_dtype", "default"),
+    ("KSamplerSelect", "sampler_name", "euler_ancestral"),
+    ("LTXVDualCFGGuider", "video_cfg", 1.0),
+    ("LTXVDualCFGGuider", "audio_cfg", 1.0),
+    ("LTXVAddGuide", "frame_idx", 0),
+    ("VAEDecodeTiled", "tile_size", 512),
+    ("VAEDecodeTiled", "overlap", 64),
+    ("VAEDecodeTiled", "temporal_size", 64),
+    ("VAEDecodeTiled", "temporal_overlap", 16),
+]
+
+
+def pinned_checks(wf, label, rep):
+    for cls, key, want in PINS:
+        for nid, n in wf.items():
+            if n["class_type"] == cls:
+                rep.check(n["inputs"].get(key) == want,
+                          f"{label}: {cls}({nid}).{key}={n['inputs'].get(key)!r}, expected {want!r}")
+    sigmas = sorted(n["inputs"].get("sigmas") for n in wf.values()
+                    if n["class_type"] == "ManualSigmas")
+    want = sorted([SIGMAS_STAGE1] if "single-stage" in label else [SIGMAS_STAGE1, SIGMAS_STAGE2])
+    rep.check(sigmas == want, f"{label}: ManualSigmas strings {sigmas}, expected {want}")
+
+
+def slot_checks(wf, label, rep):
+    for nid, n in wf.items():
+        if not rep.check(n["class_type"] in SLOTS,
+                         f"{label}: node {nid} class {n['class_type']} missing from SLOTS table"):
+            continue
+        for key, v in n["inputs"].items():
+            if is_link(v) and v[0] in wf:
+                src = wf[v[0]]["class_type"]
+                rep.check(src in SLOTS and 0 <= v[1] < SLOTS[src],
+                          f"{label}: {n['class_type']}({nid}).{key} uses slot {v[1]} "
+                          f"but {src}({v[0]}) has {SLOTS.get(src)} outputs")
+
+
+def mutation_controls(wf, mode, label, lock_names, version, rep):
+    """Negative controls: each mutation of a valid workflow MUST be reported."""
+    def set_(cls, key, value):
+        def f(w):
+            next(n for n in w.values() if n["class_type"] == cls)["inputs"][key] = value
+        return f
+
+    def bad_slot(w):
+        for n in w.values():
+            for k, v in n["inputs"].items():
+                if is_link(v) and w[v[0]]["class_type"] == "CLIPLoader":
+                    n["inputs"][k] = [v[0], 7]
+                    return
+
+    def bad_sigmas(w):
+        next(n for n in w.values() if n["class_type"] == "ManualSigmas")["inputs"]["sigmas"] += ", 0.0"
+
+    muts = [
+        ("CLIPLoader type wan", set_("CLIPLoader", "type", "wan")),
+        ("UNETLoader weight_dtype fp8", set_("UNETLoader", "weight_dtype", "fp8_e4m3fn")),
+        ("sampler euler", set_("KSamplerSelect", "sampler_name", "euler")),
+        ("cfg 3", set_("LTXVDualCFGGuider", "video_cfg", 3.0)),
+        ("sigmas changed", bad_sigmas),
+        ("link to non-existent slot", bad_slot),
+    ]
+    for name, mutate in muts:
+        copy = json.loads(json.dumps(wf))
+        mutate(copy)
+        sub = Report()
+        pinned_checks(copy, label, sub)
+        slot_checks(copy, label, sub)
+        rep.check(bool(sub.errors), f"{label}: negative control '{name}' was NOT detected")
+
+
 def static_checks(wf, mode, label, lock_names, version, rep):
+    pinned_checks(wf, label, rep)
+    slot_checks(wf, label, rep)
+    mutation_controls(wf, mode, label, lock_names, version, rep)
     titles = {}
     for nid, n in wf.items():
         titles.setdefault(n["_meta"]["title"], []).append(nid)
@@ -249,6 +341,9 @@ def lint_object_info(wf, label, info, rep):
                 if v[0] in wf:
                     src_cls = wf[v[0]]["class_type"]
                     if src_cls in info:
+                        rep.check(v[1] < len(info[src_cls]["output"]),
+                                  f"{label}: {cls}({nid}).{key} uses slot {v[1]} but "
+                                  f"{src_cls}({v[0]}) has {len(info[src_cls]['output'])} outputs")
                         st = out_type(info, src_cls, v[1])
                         rep.check(isinstance(typ, list) or type_ok(st, typ) or typ == "COMBO",
                                   f"{label}: {cls}({nid}).{key} expects {typ}, "
@@ -302,6 +397,9 @@ def run_live(args):
     if not rep.check(status == 200, f"/object_info returned HTTP {status}"):
         return finish(rep)
     info = json.loads(body)
+    for cls, n_out in SLOTS.items():
+        rep.check(cls in info and len(info[cls]["output"]) == n_out,
+                  f"SLOTS table: {cls} has {len(info.get(cls, {}).get('output', []))} outputs in the image, table says {n_out}")
     sample = {"i2v": "wf_sample.png", "v2v": "wf_sample.mp4"}
     for label, mode, path in find_workflows(args.workflows):
         wf = load(path, rep, label)
@@ -332,7 +430,8 @@ def run_live(args):
             print(f"  {'ok  ' if ok else 'FAIL'} {label:22s} {case}")
             http(args.host, "/interrupt", {})
             http(args.host, "/queue", {"clear": True})
-    exec_v2v_prep(args.host, args.workflows, rep)
+    exec_v2v_prep(args.host, args.workflows, rep, "wf_sample.mp4", None)  # 3 s: K frames
+    exec_v2v_prep(args.host, args.workflows, rep, "wf_short.mp4", 12)     # shorter than K
     exec_save_probe(args.host, args.workflows, rep)
     return finish(rep)
 
@@ -391,7 +490,7 @@ def exec_save_probe(host, root, rep):
     print(f"  {'ok  ' if ok else 'FAIL'} Math+CreateVideo+SaveVideo executed: mp4 {width}")
 
 
-def exec_v2v_prep(host, root, rep):
+def exec_v2v_prep(host, root, rep, clip, expected):
     """Really execute (CPU, no model) the V2V input chain of v2v.json:
     LoadVideo -> Video Slice -> GetVideoComponents -> ImageFromBatch -> ImageScale,
     and require exactly K frames of the requested size."""
@@ -402,11 +501,11 @@ def exec_v2v_prep(host, root, rep):
     sub = {i: n for i, n in wf.items() if n["_meta"]["title"] in keep}
     for n in sub.values():
         if n["_meta"]["title"] == "INPUT":
-            n["inputs"]["file"] = "wf_sample.mp4"
+            n["inputs"]["file"] = clip
     wid = {n["_meta"]["title"]: i for i, n in wf.items()}
     for k in ("WIDTH", "HEIGHT"):  # literal sizes instead of the primitive nodes
         sub[wid["Fit Frames To Size"]]["inputs"][k.lower()] = 320 if k == "WIDTH" else 192
-    k_expected = wf[wid["Last K Frames"]]["inputs"]["length"]
+    k_expected = expected or wf[wid["Last K Frames"]]["inputs"]["length"]
     sub["900"] = {"class_type": "SaveImage", "_meta": {"title": "probe"},
                   "inputs": {"images": [wid["Fit Frames To Size"], 0],
                              "filename_prefix": "wf_probe"}}
@@ -427,7 +526,7 @@ def exec_v2v_prep(host, root, rep):
     n_img = len(hist.get("outputs", {}).get("900", {}).get("images", []))
     rep.check(ok and n_img == k_expected,
               f"v2v prep: status={hist['status'].get('status_str')} frames={n_img}, expected {k_expected}")
-    print(f"  {'ok  ' if ok and n_img == k_expected else 'FAIL'} v2v input chain executed: {n_img} frames")
+    print(f"  {'ok  ' if ok and n_img == k_expected else 'FAIL'} v2v input chain executed on {clip}: {n_img} frames")
 
 
 def finish(rep):
