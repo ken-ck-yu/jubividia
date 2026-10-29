@@ -127,3 +127,64 @@ Harness: the engineer's mock HF server plus my own fixtures (up to 60 MB files),
 5. The lock is trust-on-first-use. Do you want the 21.5 GB transformer hash cross-checked against a second source, as the lock header and review suggest? (The int8 ComfyUI build appears to have no second public source, and the dev and distilled int8 files have identical sizes, so a swapped file would pass the size check.) A lighter option: compare one hash against the "SHA256" shown on the file's page in the browser while logged in to Hugging Face.
 6. The mount guard cannot distinguish the network volume from the pod's local volume disk. Accept this (the free-space check and the 80 GB size look-up in step 2 of your own procedure cover most of it), or add a printed `df -h` line so you can eyeball the size before the 41 GB starts?
 7. SPEC §2 and §7 still say a 100 GB volume at about $7/mo. Do you want SPEC updated to 80 GB at $5.60/mo, or is the README correction enough?
+
+## Re-check after the fix round (commits 370c651, 2b499b1, 15a032c)
+
+Verdict: **ACCEPT**. All of F1 to F8 and question 6 are resolved in behaviour, not only in text. Two minor residual observations (R1, R2) are noted and do not block.
+
+### Commands and results
+
+| Command | Result |
+|---|---|
+| `make -f scripts/models.mk test-models` | exit 0, **80 passed, 0 failed** (matches the engineer's claim) |
+| `make -f scripts/models.mk lint-models` | exit 0; shellcheck is absent here so the target prints "shellcheck not installed: skipped (only bash -n ran)" instead of failing |
+| `shellcheck scripts/download-models.sh tests/models/run.sh` (ShellCheck 0.11.0, scratch venv) | no findings |
+| `git grep` for `hf_...` tokens outside tests; `git log -S"Bearer "` | no token in tree or history (only the test fixture string) |
+
+### Findings re-verified against actual behaviour
+
+| ID | Result | Evidence |
+|---|---|---|
+| F1 tests/lint | Fixed | 80/80; lint skips gracefully. |
+| F2 README lock section | Fixed | Now says the lock is filled (2026-10-29, TOFU), `--update-lock` only for a pin bump, script still refuses if any hash is `null`. |
+| F3 token validation | Fixed | Under `bash -x`, tokens with trailing newline, trailing space, a tab, a backslash, a double quote and a control character are each rejected with "HF_TOKEN contains whitespace ... (The token is not shown.)", exit 1, zero occurrences of the token in stdout+stderr, nothing written to the volume. A valid token under `bash -x` still works (rc 0, 0 leaks). |
+| F4 run lock | Fixed | A held `.run.lock` makes download and `--prune` exit 1 with a readable message naming the lock; `--verify` and `--workflows-only` (read-only or not touching models) are not blocked. Killing the lock holder with SIGKILL leaves no stale lock (kernel releases flock); the next run succeeds. With `flock` removed from PATH the script warns "concurrent runs are not prevented" and proceeds. |
+| F4 JOBS | Fixed | `0`, `-1`, `abc`, `1.5`, and `" 2"` rejected with a clear message; `1` and `3` accepted (full run with `JOBS=1` succeeds). Empty `JOBS=` falls back to the default 2 (shell `${JOBS:-2}`), fine. |
+| F5 prune warning | Fixed (documentation) | README tells Ken to always run `--prune --dry-run` first. The script still trusts a truncated lock, by design. |
+| F6 `loras/` | Fixed | After a default run, `models/c/` (the optional category in my fixture, equivalent to `loras/`) exists empty; the test suite asserts the real categories. |
+| F7 design note | Fixed | Summary says 80 GB; Door 1 marked superseded; "Ken's decisions" (9 items) and a Phase 7 summary added. |
+| F8 verify / manifest | Fixed (documentation) | README step 4 makes the full `--verify` required and asks for `time`; a "Measured" table is added with every value "_to fill_". `.manifest-rev` is unchanged (still not a proof of full hash verification), which the README now explains. |
+| Question 6 (df) | Fixed | `df -hT` for the volume is printed to stderr with a "check size and type ~80 GB" line before downloads start (test and my run both show it). Not printed on a run that has nothing to download. |
+| Q4 `config.env.example` | Handled in text | README says HF_TOKEN is documented there after the worker branch merges; this branch does not create the file. Acceptable. |
+
+### Regression hunt for the new lock and token code
+
+- `.run.lock` (an empty file in `models/`) is listed by neither `--verify` nor `--prune`: prune explicitly skips it and my run kept it while removing a real orphan; a file outside `models/` was untouched. It does not interfere with the mountpoint guard (non-mountpoint root is still refused and nothing, including the lock, is created) or the free-space check (it is zero bytes and is created before the `df` read).
+- The lock lives on the volume, so it also covers two pods sharing the volume, provided the network filesystem honours `flock`. That is not verifiable here (see below).
+- `--prune` on a volume with no `models/` directory now creates an empty `models/` before pruning (harmless, inside the volume).
+- Token handling: `require_token` runs `set +x` inside a `local -` scope, so xtrace is restored afterwards (298 traced lines in a full run, none with the token). Token never appeared in argv (`--config /dev/fd/N`), logs, errors, `.manifest-rev` or the lock.
+
+### Residual observations (not blocking)
+
+- R1. `acquire_run_lock` opens the lock with `exec 9>"$MODELS_DIR/.run.lock"`, which truncates its target. If `.run.lock` is a symlink to another file, that file is emptied (I confirmed with a planted symlink). It requires someone to plant the symlink inside `<volume>/models`, so it is a low-risk hardening item: use `exec 9>>` (append) or refuse a symlink.
+- R2. `require_token` uses `local -`, which needs bash 5.0 or newer, while the script header says "bash 4.3+". Pod images are normally Ubuntu 22.04 (bash 5.1), so it is fine in practice; the header comment should say 5.0+.
+- R3. Typing `--help` with an invalid `JOBS` exits with the JOBS error (the check runs before argument parsing). Cosmetic.
+
+### Still cannot be verified without a real pod, volume and token
+
+1. Real gated behaviour with a valid token: the `HEAD resolve` status (302 expected), and the exact 403 for an account that has not accepted the license. Only the unauthenticated 401 with `GatedRepo` was observed.
+2. Real CDN redirect and signed-URL behaviour: that curl drops the Authorization header on the cross-host hop, and that `-C -` resume works against real CDN URLs.
+3. The nine sha256 values themselves (masked without a token; trust on first use).
+4. `mountpoint -q` on the real pod mount, and whether `df -hT` shows a network filesystem of about 80 GB rather than the pod's local volume disk.
+5. That `flock` works on the RunPod network volume filesystem (some network filesystems do not support it; the failure would then show as a misleading "another run is using" message).
+6. Throughput, total download time, and the time of the full `--verify` hashing pass (the README "Measured" table is empty until the first real run).
+7. US-WA-1 stock for a CPU pod (or the GPU fallback) and for the RTX 6000 Ada serverless GPU.
+8. A real out-of-space (ENOSPC) event; only simulated with a file-size limit.
+9. A hot volume resize, and that `extra_model_paths.yaml` resolves each category in a real ComfyUI worker.
+10. That the GitHub repo is public today (needed for the plain `git clone`).
+
+### Questions
+
+1. Fix R1 (use append or refuse a symlink) and R2 (header says bash 5.0+) now, or accept as known? Neither blocks the merge.
+2. Who confirms the repo is public (item 10) before the first pod run?
+3. If `flock` turns out to be unsupported on the volume (item 5), is it acceptable to fall back to running without the lock for that one supervised run (the script's existing flock-missing path only covers a missing binary, not an unsupported filesystem)?
