@@ -283,8 +283,10 @@ describe("secrets", () => {
     await clearBucket();
     texts.push(await (await gen({ mode: "t2v", prompt: "x" })).text());
     const all = texts.join("\n") + logs.join("\n");
-    for (const v of [SECRETS.RUNPOD_API_KEY, SECRETS.RUNPOD_ENDPOINT_ID, "ken@example.test", "fake-team.cloudflareaccess", "test-aud-0123456789abcdef"]) {
+    for (const v of [SECRETS.RUNPOD_API_KEY, SECRETS.RUNPOD_ENDPOINT_ID, "fake-team.cloudflareaccess", "test-aud-0123456789abcdef", "partner@example.test"]) {
       expect(all, v).not.toContain(v);
     }
+    // the signed-in address is shown to its owner in /api/state only; never logged
+    expect(logs.join("\n")).not.toContain("example.test");
   });
 });

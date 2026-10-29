@@ -48,8 +48,46 @@ describe("access JWT", () => {
     expect(res.status).toBe(200);
   });
 
+  it("allows each listed email, rejects a third, and tolerates whitespace, case and empty entries", async () => {
+    expect((await send("/", { jwt: await mintJwt({ email: "ken@example.test" }) })).status).toBe(200);
+    expect((await send("/", { jwt: await mintJwt({ email: "partner@example.test" }) })).status).toBe(200);
+    const third = await send("/", { jwt: await mintJwt({ email: "third@example.test" }) });
+    expect(third.status).toBe(403);
+    expect(await third.text()).toBe("");
+    const env = makeEnv({ ALLOWED_EMAILS: "  Ken@Example.test ,, PARTNER@example.test  ,x" });
+    expect((await send("/", { env, jwt: await mintJwt({ email: "partner@example.test" }) })).status).toBe(200);
+    expect((await send("/", { env, jwt: await mintJwt({ email: "KEN@EXAMPLE.TEST" }) })).status).toBe(200);
+    expect((await send("/", { env, jwt: await mintJwt({ email: "x" }) })).status).toBe(403);
+    // a prefix or suffix of an allowed address is not allowed
+    expect((await send("/", { jwt: await mintJwt({ email: "en@example.test" }) })).status).toBe(403);
+    expect((await send("/", { jwt: await mintJwt({ email: "ken@example.test.evil" }) })).status).toBe(403);
+  });
+
+  it("fails closed when the list is empty or has no addresses", async () => {
+    for (const v of ["", "  ", ",,", "no-at-sign"]) {
+      expect((await send("/", { env: makeEnv({ ALLOWED_EMAILS: v }) })).status, v).toBe(503);
+    }
+  });
+
+  it("shows who is signed in and records only a hash of the requester in the lock", async () => {
+    const { runpod, bucket } = await import("./helpers.js");
+    const me = await (await send("/api/state", { jwt: await mintJwt({ email: "partner@example.test" }) })).json();
+    expect(me.me).toBe("partner@example.test");
+    const gen = (email) => mintJwt({ email }).then((jwt) => send("/api/generate", { method: "POST", jwt, json: { mode: "t2v", prompt: "x" } }));
+    expect((await gen("ken@example.test")).status).toBe(202);
+    const rec = await (await bucket().get("state/active.json")).text();
+    expect(rec).not.toContain("example.test");
+    expect(rec).toMatch(/"by":"[0-9a-f]{8}"/);
+    const second = await gen("partner@example.test");
+    expect(second.status).toBe(409);
+    expect((await second.json()).message).toContain("someone else");
+    const st = await (await send("/api/state", { jwt: await mintJwt({ email: "ken@example.test" }) })).json();
+    expect(st.mine).toBe(true);
+    expect(runpod.calls.filter((c) => c.path === "/run").length).toBe(1);
+  });
+
   it("fails closed with 503 and an empty body when any auth secret is missing", async () => {
-    for (const k of ["TEAM_DOMAIN", "POLICY_AUD", "ALLOWED_EMAIL"]) {
+    for (const k of ["TEAM_DOMAIN", "POLICY_AUD", "ALLOWED_EMAILS"]) {
       const res = await send("/", { env: makeEnv({ [k]: undefined }) });
       expect(res.status, k).toBe(503);
       expect(await res.text()).toBe("");

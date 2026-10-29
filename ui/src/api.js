@@ -21,6 +21,7 @@ import {
   dailyCap,
 } from "./guard.js";
 import { mapStatus, TERMINAL } from "./status.js";
+import { emailTag } from "./auth.js";
 import { UPLOAD_KEY_RE } from "./upload.js";
 import * as calc from "../static/calc.js";
 
@@ -60,8 +61,7 @@ function publicActive(a, state) {
     reserved_at: a.reserved_at || null,
     reservation: a.state || null,
     cold_likely: !!a.cold_likely,
-    cancel_requested: !!a.cancel_requested_at,
-    state: state || (a.job_id ? "running" : "starting"),
+    cancel_requested: !!a.cancel_requested_at,    state: state || (a.job_id ? "running" : "starting"),
   };
 }
 
@@ -88,7 +88,7 @@ export function limitsInfo(env) {
 
 // ------------------------------------------------------------------ GET /api/state
 
-export async function handleState(env, now = Date.now()) {
+export async function handleState(env, me, now = Date.now()) {
   const cfg = runpodConfig(env);
   const rate = rateOf(env);
   const cap = dailyCap(env);
@@ -127,6 +127,8 @@ export async function handleState(env, now = Date.now()) {
   const last = await readLast(env.BUCKET);
 
   return json(200, {
+    me: me || null, // the verified Access email, shown (escaped) in the page header
+    mine: !!(active && me && active.by && active.by === (await emailTag(me))),
     gpu: gpuState(health),
     workers: health ? health.workers : null,
     queue: health ? { in_queue: health.inQueue, in_progress: health.inProgress } : null,
@@ -156,7 +158,7 @@ function runFailure(status) {
   );
 }
 
-export async function handleGenerate(request, env, now = Date.now()) {
+export async function handleGenerate(request, env, me, now = Date.now()) {
   const body = await readJsonBody(request);
   const { errors, p } = calc.validateParams(body);
 
@@ -202,6 +204,7 @@ export async function handleGenerate(request, env, now = Date.now()) {
     mode: p.mode,
     submitted_at: null,
     cold_likely: false,
+    by: me ? await emailTag(me) : null, // short hash, never the address
   };
   const got = await guardNet(reserve(env.BUCKET, cfg, record, now));
   if (got.kind === "same") {
@@ -209,7 +212,11 @@ export async function handleGenerate(request, env, now = Date.now()) {
     throw new HttpError(409, "busy", "This request is still being submitted.", { active: publicActive(got.record) });
   }
   if (got.kind === "busy") {
-    throw new HttpError(409, "busy", "A clip is already running.", { active: publicActive(got.record) });
+    const mine = !!(got.record && me && got.record.by === (await emailTag(me)));
+    throw new HttpError(409, "busy", mine ? "A clip is already running." : "Another job is running (started by someone else). Wait for it to finish.", {
+      active: publicActive(got.record),
+      mine,
+    });
   }
 
   // From here on we hold the reservation: every early exit releases it.

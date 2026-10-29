@@ -1,6 +1,6 @@
 # jubividia front end: one Worker, workers.dev only. No secrets and no personal data in this file.
 # Secrets (set with infra/cloudflare/apply.sh secrets, only after the Access app is verified):
-#   RUNPOD_API_KEY  RUNPOD_ENDPOINT_ID  ALLOWED_EMAIL  TEAM_DOMAIN  POLICY_AUD
+#   RUNPOD_API_KEY  RUNPOD_ENDPOINT_ID  ALLOWED_EMAILS (comma-separated)  TEAM_DOMAIN  POLICY_AUD
 # Until they exist every request gets 503 (fail closed).
 name = "jubividia"
 main = "src/index.js"

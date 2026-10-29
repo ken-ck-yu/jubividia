@@ -28,14 +28,14 @@ function sameOrigin(request, url) {
   return site === null || site === "same-origin";
 }
 
-async function route(request, env, url) {
+async function route(request, env, url, me) {
   const { pathname } = url;
   const m = request.method;
 
   if (pathname.startsWith(API_PREFIX)) {
-    if (pathname === "/api/state") return m === "GET" ? handleState(env) : methodNotAllowed("GET");
+    if (pathname === "/api/state") return m === "GET" ? handleState(env, me) : methodNotAllowed("GET");
     if (pathname === "/api/upload") return m === "PUT" ? handleUpload(request, env) : methodNotAllowed("PUT");
-    if (pathname === "/api/generate") return m === "POST" ? handleGenerate(request, env) : methodNotAllowed("POST");
+    if (pathname === "/api/generate") return m === "POST" ? handleGenerate(request, env, me) : methodNotAllowed("POST");
     if (pathname.startsWith("/api/status/")) {
       return m === "GET" ? handleStatus(env, pathname.slice("/api/status/".length)) : methodNotAllowed("GET");
     }
@@ -78,7 +78,7 @@ export default {
         return secure(json(403, { error: "forbidden", message: "Cross-site request refused." }));
       }
       if (request.method === "OPTIONS") return secure(bare(405)); // no CORS, ever
-      return secure(await route(request, env, url));
+      return secure(await route(request, env, url, auth.email));
     } catch (e) {
       if (e instanceof HttpError) return secure(errorResponse(e));
       log("unhandled", { name: e && e.name ? String(e.name) : "Error" });

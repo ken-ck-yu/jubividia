@@ -486,4 +486,14 @@ Binding for the implementation. Where they differ from the architect's text abov
 9. **Cancel button included in v1.**
 10. **Ken's email and Access identifiers** (`ALLOWED_EMAIL`, `TEAM_DOMAIN`, `POLICY_AUD`) are Worker secrets, never in the repo. Worker secrets are set only after Ken confirmed the Access app works.
 
+### Update: two users (Ken and a second person)
+
+Overrides the single-email wording above (decisions 2, 3 and 10):
+
+- The secret `ALLOWED_EMAIL` becomes `ALLOWED_EMAILS`, a comma-separated list (any number, trimmed, compared case-insensitively against the verified Access JWT `email` claim; empty or no addresses fails closed with 503; anyone else gets 403). The Worker never logs the list; no real address is in the repo or the tests (`example.test` fixtures).
+- Login stays Cloudflare Access with one-time PIN; the Worker checks only the JWT, not the login method. The Access policy must list both emails (free Zero Trust allows 50 users).
+- Limits are shared: one active job (the R2 reservation), `DAILY_CAP` shared (default 30), failed attempts count. No per-user quota in v1.
+- The gallery is shared: both users see every clip. No owner field is added to sidecars (that needs a handler change and an image rebuild). The page header shows the signed-in email (rendered with `textContent`). `state/active.json` stores `by`, a short SHA-256 prefix of the requester's email, never the address; a second user who hits the lock is told another job is running.
+- Known limitation: shared gallery and shared cap. Private galleries (owner field in the sidecar, per-user listing, per-user cap) would be a later change.
+
 All other reviewer changes stay requirements: `preview_urls=false` explicitly, server-generated input keys `inputs/<uuid>.<ext>` from an extension allowlist (type derived from the extension when iOS gives an empty `File.type`; magic-byte check required; webm and HEIC get 415), the sidecar-json-last completion-marker invariant documented, assertion of the Worker id after deploy, lifecycle rules read-and-merge, baseline and post-check reads of `jubilab-website` `modified_on`, escaped rendering of prompts and sidecar fields, Range/206 correctness for iOS Safari.

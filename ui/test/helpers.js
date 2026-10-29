@@ -9,6 +9,7 @@ import worker from "../src/index.js";
 export const TEAM = "https://fake-team.cloudflareaccess.test";
 export const AUD = "test-aud-0123456789abcdef";
 export const EMAIL = "ken@example.test";
+export const EMAIL2 = "partner@example.test";
 export const ORIGIN = "https://jubividia.example.test";
 export const SECRETS = {
   RUNPOD_API_KEY: "rpa_TESTKEY_SECRET_VALUE_123",
@@ -139,7 +140,7 @@ export function makeEnv(over = {}) {
     DAILY_CAP: "30",
     TEAM_DOMAIN: TEAM,
     POLICY_AUD: AUD,
-    ALLOWED_EMAIL: EMAIL,
+    ALLOWED_EMAILS: `${EMAIL}, ${EMAIL2}`,
     ...SECRETS,
     ASSETS: { fetch: async () => new Response("<!doctype html><title>x</title>", { headers: { "Content-Type": "text/html" } }) },
     ...over,

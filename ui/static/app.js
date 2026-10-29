@@ -136,6 +136,7 @@ function renderStrip() {
   const u = s.usage;
   setText("usage", `${u.today} of ${u.cap} clips today. Resets ${localTime(u.resets_at)} your time.`);
   if (!s.configured) setText("usage", "The GPU service is not configured yet.");
+  setText("me", s.me ? `Signed in as ${s.me}` : "");
 }
 
 // ------------------------------------------------------------------ mode and file
