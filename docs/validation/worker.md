@@ -224,3 +224,58 @@ All twelve defects and the engineer-owned questions are fixed or properly docume
 3. **B-6**: add `COMFY_PID_FILE` to `config.env.example`.
 
 Optional (low): B-1, B-3, B-5. The gating GPU run and the first real R2 upload remain mandatory before the feature can be called done.
+
+
+---
+
+# Second re-check (2026-10-29, after commits 9f3af36 and 4a1d5a8)
+
+Validated at `feat/worker` @ `4a1d5a8` by the validator agent. Same method as the first re-check: real handler, real boto3 and `requests` against local fake S3 and ComfyUI servers on 127.0.0.1 (script `$CLAUDE_JOB_DIR/tmp/re6.py`, outside the repo). No RunPod or Cloudflare call; `config.env` not read.
+
+## Re-run
+
+| Command | Outcome |
+|---|---|
+| `make test` | 98 passed |
+| `make lint` | clean |
+| `docker build --no-cache -t ltx25-worker:val3 worker` | succeeded; `pip freeze` of the new image is identical to `worker/constraints.txt`; image `/handler.py` has the same md5 as the repo file. Tag removed afterwards |
+| `make smoke` (cached image and `--no-cache` image) | 19 PASS, 0 FAIL on both |
+| Secrets in tree (`git grep`) and history | none; all tracked files are 100644 |
+
+## Fixes verified
+
+| Item | Result |
+|---|---|
+| **A-5, stalled endpoint, default budget** | `upload_failed` after **93.2 s** (3 tries x 30 s read timeout + backoff), engineer's claim ~96 s holds |
+| A-5, 20 s hard deadline | `upload_failed` after **20.0 s** (`timed out after 20s`); the deadline is checked before every try (`remaining < 1` breaks out) |
+| A-5, generation used the full default budget (780 s, simulated by shifting the clock), then a stalled R2 | uploads gave up at a virtual **872 s** since job start, below the 885 s hard deadline and the 900 s platform limit |
+| Orphan cleanup bounded | json 403 plus a DELETE that never answers: job returned `upload_failed` after 23.1 s (each delete capped at 10 s and skipped once the deadline is near) |
+| Slow but successful uploads | 20 s per PUT: success (60 s total). 25 s per PUT: success (75 s). 40 s per PUT: cut off by the 30 s read timeout and fails after 93 s (expected; see N-1) |
+| Thread leak | each timed-out attempt leaves a daemon thread until its socket times out (at most 30 s later, as boto's own read timeout still applies); 4 were visible immediately after the stall run and none can block process exit. No growth beyond tries x files per job |
+| JOB_TIMEOUT_S 840 -> 780 | consistent: handler default, README ("generation gets 780 s", 885 s upload deadline) and `config.env.example` (`JOB_TIMEOUT_S=780`, "at most ~800") agree; no remaining `840` in the repo |
+| B-2 | `/history` returning 500: `comfy_unavailable` after 3 polls, 0.1 s (was: polled until the deadline) |
+| B-6 | `COMFY_PID_FILE` is in `config.env.example` with the right default |
+| B-1 | 309+ digit integers in `width`, `seed`, `duration`, `fps`, `num_frames` all give `bad_input` |
+| B-3 | `/prompt` 500 gives `comfy_error` ("server error (HTTP 500)"); 400 gives `workflow_mismatch`; 503 with OOM text still gives `oom`; a node whose `_meta.title` is a list is ignored and the job succeeds |
+| Q1 | every error text now starts with `[code] ` (for example `[bad_input] mode must be one of ...`) while `error_code` is kept; documented in README. Whether RunPod keeps `output.error_code` is still unverified, but the code is now readable from the text either way |
+
+## New observations (all low, none blocking)
+
+- **N-1**: the per-attempt cap is a read timeout of 30 s plus 45 s thread limit. A single PUT whose response takes over 30 s (very large clip on a slow link) is cut off and retried, then fails. At 24 fps x 20 s the mp4 is tens of MB, so this should not trigger on R2, but the first real upload should record the upload times.
+- **N-2**: an abandoned attempt can still complete on the server after the worker has reported failure (reproduced: the mp4 PUT landed after the timeout), leaving an `.mp4` in R2 without a sidecar. The cleanup only deletes keys the worker saw succeed. The gallery must list by `.json`, as already stated.
+- **N-3**: the input download (`fetch_input`) is still bounded only by boto's 5 s / 30 s timeouts, not by the deadline.
+
+## Verdict: ACCEPT
+
+All earlier required fixes (A-5, B-2, B-6) and optional ones (B-1, B-3) are verified. The remaining items (N-1..N-3, B-5) are low and documented.
+
+## Still unverifiable without a GPU, models, R2 or RunPod (for the PR description)
+
+- Any real generation: int8-convrot loading and speed on the RTX 6000 Ada (sm_89, torch 2.11+cu128, `comfy_kitchen` warns about cu130), peak VRAM, cold and warm timings (SPEC criteria 2 and 3). Ken's decision-8 gate; not run.
+- That Gemma 4 and the LTX nodes load with real weights under transformers 5.21.0 / huggingface_hub 2.3.0.
+- Real R2: that uploads succeed with the `when_required` checksum options, `region_name="auto"` signing, CORS and token permissions, and real timeout behaviour (all upload timings above come from a local fake).
+- That RunPod's `/status` for a FAILED job exposes `output.error_code` (only the SDK-side shape and the `[code]` text prefix are verified).
+- Real ComfyUI error wording for OOM and missing models, the real `/history` shape for the LTX graph, and whether the mp4 contains audio.
+- The real `start.sh` PID file under RunPod (verified only with a bash-PID-1 emulation), the GPU preflight, and network-volume behaviour.
+- GitHub Actions: disk and GHA cache with a 24.75 GB image, GHCR push and public visibility (workflow only linted).
+- Whether the real LTX 2.5 example workflows use the node classes and fields the contract expects (`workflows` feature).
