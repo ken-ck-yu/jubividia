@@ -148,3 +148,62 @@ Uploads use boto3 with `request_checksum_calculation` / `response_checksum_valid
 `worker/constraints.txt` is a `pip freeze` of the built image, used as a pip constraints file so rebuilds resolve to the same versions (no torch-family changes).
 
 Environment variables are documented in [`config.env.example`](config.env.example). The LTX-2.x Community License (free under $10M revenue) applies to the model weights.
+
+## Endpoint (`infra/runpod/`)
+
+`infra/runpod/apply.sh` creates and verifies the RunPod resources from `config.env`: the network volume, the two R2 secrets, the serverless endpoint and the temporary model-download pod. It is a bash script over the RunPod REST API (no maintained Terraform provider covers endpoints, volumes and secrets). It is idempotent (re-running makes no create calls), supports `--dry-run` (reads only), writes the ids back to `config.env`, never prints secret values, refuses to run under `bash -x`, and has **no code path that deletes the volume or the two R2 secrets**. A read-back mismatch is fixed by patching the one differing field; the script never deletes an endpoint on its own (only `teardown-endpoint --yes` does).
+
+> **Unverified without a real call:** the REST base URL (`RUNPOD_API_BASE`, default `https://rest.runpod.io/v1`) and the exact route and field names (`/network-volumes`, `/secrets`, `/endpoints`, `/pods`, `cmd`, `mounts`, ...) follow the design note, not a live check. Run `apply.sh preflight` first (read-only); fix any 4xx from it before anything billable. The routes are plain string literals in `infra/runpod/apply.sh`.
+
+### Setup from zero (endpoint)
+
+1. `cp config.env.example config.env`, `chmod 600 config.env`, fill `RUNPOD_API_KEY`, `HF_TOKEN` (read-only), `R2_*` (token scoped to the one bucket, Object Read & Write), `RUNPOD_POD_IMAGE`. Set `IMAGE_TAG` to the `sha-<short>` tag of the CI build **of the merge that contains the `peak_vram_mb` worker change** (read it from the `build-worker` run; the GHCR package must be public). `latest` and anything not matching `^sha-[0-9a-f]{7,}$` is rejected. `GIT_REF` is the full commit sha the temp pod checks out.
+2. Add a payment method and fund about $15 in the RunPod console, and enable a low-balance notification (a volume can be removed by the platform at $0 balance; the REST API cannot read the balance).
+3. `infra/runpod/apply.sh preflight`, then `--dry-run` of each command you are about to run.
+
+### Billable steps, in order (prices from the design note, 2026-10-29 reads)
+
+| # | Command | Bills | Expected |
+|---|---|---|---|
+| 1 | `apply.sh volume` (80 GB STANDARD, US-WA-1) | $0.07/GB/month, accrues hourly until deleted in the console | $5.60/month standing cost |
+| 2 | `apply.sh secrets` | free | $0 |
+| 3 | `apply.sh pod-up`, wait for `MODELS DONE` in `pod-logs`, then **`apply.sh pod-down`** | CPU pod cpu3c 2 vCPU secure about $0.06/hr plus a small container disk; 41 GB download + verify, 20-40 min | $0.02-0.04, cap about $0.08 (1 h) |
+| 4 | `apply.sh endpoint --max-workers 1` (gate runs with one worker) | $0 idle; $1.75/hr per running RTX 6000 Ada worker | $0 |
+| 5 | `scripts/smoke-job.sh` (the gate, below) | $1.75/hr while a worker runs | about $1-2 expected, about $5-6 worst case |
+| 6 | `apply.sh endpoint` (restores max workers 2) | $0 | $0 |
+
+**`pod-up` leaves a pod running until you terminate it** (it ends with `sleep infinity` so it stays inspectable). It prints a banner; `pod-down` terminates it (not stop), reads back that it is gone, and deletes the temporary `hf_token_tmp` secret. That secret is the one deliberate exception to "never auto-delete secrets": it is deleted by exact name and nothing else is. Afterwards **rotate the Hugging Face token**. The token reaches the pod only as `{{ RUNPOD_SECRET_hf_token_tmp }}`, the clone is pinned to `GIT_REF`.
+
+Commands: `preflight`, `volume`, `secrets [--rotate]`, `endpoint [--max-workers N]`, `pod-up`, `pod-logs`, `pod-down`, `status`, `teardown-endpoint --yes`; all accept `--dry-run`. R2 secret values are write-only on RunPod: keep your own copy. Rotating (`secrets --rotate`) reaches workers at their next boot.
+
+### What the endpoint is set to
+
+RTX 6000 Ada only (`NVIDIA RTX 6000 Ada Generation`: pool `ADA_48_PRO` minus `NVIDIA L40`, `NVIDIA L40S` and the `MIG 2g.48gb` type, always sent together), `dataCenterIds` US-WA-1 with the volume mounted, `minCudaVersion` 12.8, workers min 0 / max 2, idle timeout 60 s, `QUEUE_DELAY` scaling, FlashBoot sent explicitly (REST default is OFF), execution timeout 900000 ms (**our own spend-safety choice, not a RunPod limit**; RunPod allows 5 s to 7 days; the script reads it back and the worker learns it as `EXEC_TIMEOUT_S`), R2 key id and secret as `{{ RUNPOD_SECRET_ltx_r2_access_key_id }}` / `{{ RUNPOD_SECRET_ltx_r2_secret_access_key }}`. Changing `IMAGE_TAG` or env creates a new release and replaces workers.
+
+### Running the gate
+
+`scripts/smoke-job.sh` (add `--no-r2-check` if `aws`/`ffprobe` are not installed; the audio and R2 checks are then unverified). It uses `/run` + `/status` + `/health` only. Order: (1) canary: a missing-input i2v job, which needs good R2 secrets but never loads models (a "could not fetch input" error means the secrets did not resolve); (2) cold tiny t2v; (3) warm tiny; (4) warm default 1280x704x121; (5) second warm default; (6) wait for scale to zero, (7) cold default clip (the real first-after-idle path). **Pass** = no OOM, no offload, the second warm default job within 10% of the first, audio present, the three R2 objects exist. 46 GB peak VRAM is report-only. Offload cannot be seen from job data: read the worker logs. **Cold start** = `delayTime + executionTime` of a job minus its `gen_time_s`; the first-ever cold start can include a billed 24.75 GB image pull, so judge the second. Each job is appended to `docs/validation/endpoint-timings.csv`. It **stops and asks Ken** (exit 3) when a worker goes Unhealthy, a job stays IN_PROGRESS past 15 min (a cancel is sent), a job sits in the queue throttled past 5 min, cold start exceeds 600 s, cold-tiny start plus warm default gen time exceeds 700 s, or warm default gen time exceeds 300 s. Do not work around a stop.
+
+### Teardown and recovery
+
+- `apply.sh teardown-endpoint --yes`: sets max workers 0, deletes the endpoint (config only); the volume and secrets stay. Re-create with `apply.sh endpoint`. The volume can only be deleted in the console, and that loses the 41 GB of models.
+- **Idle auto-scale-down:** RunPod lowers an endpoint's max workers after 3 days without requests (to 2) and sets it to 0 after 7. Jobs then fail or queue (a 409 paused endpoint). `apply.sh status` warns when max workers differs from `RUNPOD_WORKERS_MAX`; **`apply.sh endpoint` restores it**.
+- Stale pod: `apply.sh status` warns if `jubividia-models-tmp` exists; `apply.sh pod-down` terminates it.
+
+### Measured (fill in after the gate)
+
+| Item | Value |
+|---|---|
+| Cold start, first ever / second (delay + exec - gen) | _to fill_ |
+| Warm default clip `gen_time_s` (1280x704x121) | _to fill_ |
+| Cold + default clip total (user path) | _to fill_ |
+| Peak VRAM (`peak_vram_mb`) | _to fill_ |
+| Cost per clip, measured | _to fill (SPEC §7's 3-minute example assumes cold+gen about 3 min)_ |
+
+### Tests
+
+```
+make -f infra/runpod/infra.mk test-infra
+```
+
+Plain bash plus a stdlib Python fake of the RunPod REST API, serverless runtime and GHCR, all on 127.0.0.1. It covers idempotency, `--dry-run`, the three REST traps, kill between create and write-back, tag rejection, secret hygiene (output, `bash -x`, curl argv, temp files), the no-delete grep, read-back mismatch handling and the gate runner. `make -f infra/runpod/infra.mk lint-infra` runs `bash -n` and `shellcheck` when installed.
