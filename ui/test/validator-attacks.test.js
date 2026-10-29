@@ -345,7 +345,7 @@ describe("VALIDATOR auth gate", () => {
     const open = await send("/", { jwt: await mint(team), env });
     expect(open.status).toBe(200);
     const html = await open.text();
-    expect(html).toContain("<title>jubividia</title>");
+    expect(html).toContain("<title>JubiVidia</title>");
     expect(open.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
     await expectClosed("/", "", env);
     await expectClosed("/app.js", "garbage", env);

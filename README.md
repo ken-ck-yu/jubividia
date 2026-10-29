@@ -279,6 +279,18 @@ Two people (Ken and a second person). Cloudflare Access (one-time PIN, 24 h sess
 
 All subcommands accept `--dry-run` (no Cloudflare write). `teardown` prints the undo steps. Offline tests: `bash tests/cloudflare/run.sh` (fake Cloudflare API on 127.0.0.1; test mode refuses any other host).
 
+### Personalising the page
+
+The masthead shows the name "JubiVidia", a tagline and, optionally, a small round photo. The photo is **optional and never committed**: the repository is public, so `ui/static/brand.jpg` is in `.gitignore`, and `ui/scripts/check-static.mjs` (run by `npm test`) fails if any image file is tracked. Without the file (a fresh clone) the page simply shows the text brand.
+
+To use your own photo, put it at `ui/static/brand.jpg` **before** `infra/cloudflare/apply.sh deploy` (the file is uploaded with the other static files and, like them, served only after the Access check). Make it square, small and free of metadata (EXIF, GPS). With ffmpeg (for example in the worker image: `docker run --rm -v "$PWD":/w --entrypoint ffmpeg <worker-image> ...`):
+
+```
+ffmpeg -i original.jpg -vf "crop=min(iw\,ih):min(iw\,ih),scale=480:480" -q:v 6 -map_metadata -1 -an -frames:v 1 ui/static/brand.jpg
+```
+
+(Adjust the crop, for example `crop=1080:1080:0:60`, to pick the part of a portrait photo you want.) About 15 to 40 KB is plenty; the page shows it at 60 px.
+
 ### Limits and cost
 
 - One active job at a time (compare-and-swap reservation in R2 `state/active.json`; also refused while RunPod `/health` shows jobs in flight; a timed-out submit keeps the lock; Cancel keeps it until RunPod reports a terminal state).

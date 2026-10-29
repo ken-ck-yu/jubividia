@@ -649,7 +649,25 @@ async function refreshGallery(reset) {
 }
 
 // ------------------------------------------------------------------ wiring
+// The brand photo is optional (git-ignored): show it only if it loads; otherwise the text brand stands alone.
+function initBrandImage() {
+  const img = $("brand-img");
+  if (!img) return;
+  img.addEventListener("load", () => {
+    img.hidden = false;
+  });
+  img.addEventListener("error", () => {
+    img.remove();
+  });
+  // hidden images still load; if it finished before this script ran, handle that too
+  if (img.complete) {
+    if (img.naturalWidth > 0) img.hidden = false;
+    else img.remove();
+  }
+}
+
 function init() {
+  initBrandImage();
   for (const r of document.querySelectorAll('input[name="mode"]')) r.addEventListener("change", () => setMode(r.value));
   $("file").addEventListener("change", onFile);
   for (const id of ["prompt", "seed", "width", "height", "duration", "fps"]) $(id).addEventListener("input", updateForm);

@@ -562,6 +562,8 @@ Adds three rules to the bucket (existing rules are read, merged and written back
 
 ### 8.5 Deploy the Worker with no secrets
 
+Optional first: personalise the page with your own round photo at `ui/static/brand.jpg` (git-ignored on purpose; see README, "Personalising the page"). Without it the page shows just the text brand.
+
 ```
 infra/cloudflare/apply.sh deploy
 ```

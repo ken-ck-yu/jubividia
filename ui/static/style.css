@@ -48,6 +48,11 @@ h2 { font-size: 1.1rem; margin: 20px 0 8px; }
 .warn { background: var(--warn-bg); color: var(--warn-fg); padding: 10px 12px; border-radius: 10px; margin: 12px 0; }
 [hidden] { display: none !important; }
 
+.masthead { display: flex; align-items: center; gap: 12px; padding: 12px 0 4px; min-height: 64px; }
+.brand-img { width: 60px; height: 60px; flex: none; border-radius: 50%; object-fit: cover; border: 2px solid var(--line); background: var(--card); }
+.brand-text { min-width: 0; }
+.brand-name { margin: 0; font-size: 1.5rem; font-weight: 800; letter-spacing: -0.01em; line-height: 1.15; }
+.brand-tag { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; line-height: 1.3; overflow-wrap: anywhere; }
 .strip { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 6px 0; }
 .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); font-size: 0.9rem; }
 .badge.warm { border-color: var(--ok); color: var(--ok); }

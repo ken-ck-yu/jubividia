@@ -5,17 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="robots" content="noindex, nofollow">
-  <title>jubividia</title>
+  <title>JubiVidia</title>
   <link rel="stylesheet" href="style.css">
   <script type="module" src="app.js"></script>
 </head>
 <body>
 <main>
-  <header class="strip" aria-live="polite">
+  <header class="masthead">
+    <img id="brand-img" class="brand-img" src="brand.jpg" alt="" width="60" height="60" hidden>
+    <div class="brand-text">
+      <p class="brand-name">JubiVidia</p>
+      <p class="brand-tag">Short videos from words, photos and clips.</p>
+    </div>
+  </header>
+
+  <div class="strip" aria-live="polite">
     <span id="gpu-badge" class="badge">GPU: checking...</span>
     <span id="usage" class="muted"></span>
     <span id="me" class="muted"></span>
-  </header>
+  </div>
 
   <section aria-labelledby="h-create">
     <h1 id="h-create">New clip</h1>
