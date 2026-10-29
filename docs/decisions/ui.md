@@ -470,3 +470,20 @@ None that matter. Closest: deleting and recreating the Worker silently detaches 
 5. **iPhone clips.** If V2V fails on portrait, HDR or 60 fps phone clips, may the worker add an ffmpeg normalisation step (a worker change, discussed before doing)?
 6. **RunPod key scope.** May the coordinator create a RunPod API key restricted to the `jubividia-ltx25` endpoint for the Worker (if the console supports it) instead of reusing the account key?
 7. **Timezone.** Should the page show the daily reset in your local time while the cap stays on the UTC day?
+
+## Ken's decisions
+
+Binding for the implementation. Where they differ from the architect's text above or the reviewer's suggestions, these win.
+
+1. **Worker name `jubividia`.**
+2. **Ken creates the Access application himself** in the Cloudflare dashboard ("protect this Worker with Access" on the Worker). The tooling token therefore has no Zero Trust scope. The Worker verifies the `Cf-Access-Jwt-Assertion` JWT itself on every request (issuer, audience, email claim, `createRemoteJWKSet` at module scope, small `clockTolerance`) and fails closed. The deploy tooling's verification step checks that an unauthenticated request to the workers.dev URL is redirected to the Access login and never serves the app. There is no `idp-otp`/`access` subcommand in the script.
+3. **Login method**: one-time PIN to Ken's email, 24 h session.
+4. **Spend limits.** One active job at a time using the reviewer's compare-and-swap reservation in R2 (`state/active.json`, create-if-absent with `If-None-Match`; also refuse when RunPod `/health` shows inQueue + inProgress > 0; roll back only on a definitive 4xx/5xx from `/run`; a timeout keeps the reservation; Cancel does not release the lock until `/status` is terminal). **Daily cap: 30 clips per UTC day**, configurable with the Worker var `DAILY_CAP`; failed attempts count. Job policy `ttl` 30-35 minutes and `executionTimeout` 900000 ms. The page shows the reset time in the viewer's local time.
+5. **No size presets limit the UI.** Width/height (multiples of 64) and duration/frames are free within the handler's hard bounds (256..2048 per side, at most 481 frames, fps as the handler allows). Beyond the measured envelope (1280x704x121) the page shows a clear warning ("untested: may take much longer, can fail or run out of memory, and a failed run still bills until it stops; the run is capped at 15 minutes ~ $0.44") and an estimated worst-case cost, but allows it. `gen_time_s`, `peak_vram_mb` and an estimated cost are shown for every finished clip (gallery and player). V2V keeps its 33-frame minimum.
+6. **Uploads capped at 95 MB** with a clear message; chunked upload is a later change.
+7. **The Worker uses a RunPod key restricted to the endpoint** (secret `RUNPOD_API_KEY`; endpoint id secret `RUNPOD_ENDPOINT_ID`).
+8. **Cloudflare tooling token** (`CLOUDFLARE_API_TOKEN` in `config.env`, short-lived; scopes Workers Scripts Edit + Workers R2 Storage Edit + Account Settings Read) is used only by `infra/cloudflare/apply.sh` and wrangler. The account id is the same value as `R2_ACCOUNT_ID`.
+9. **Cancel button included in v1.**
+10. **Ken's email and Access identifiers** (`ALLOWED_EMAIL`, `TEAM_DOMAIN`, `POLICY_AUD`) are Worker secrets, never in the repo. Worker secrets are set only after Ken confirmed the Access app works.
+
+All other reviewer changes stay requirements: `preview_urls=false` explicitly, server-generated input keys `inputs/<uuid>.<ext>` from an extension allowlist (type derived from the extension when iOS gives an empty `File.type`; magic-byte check required; webm and HEIC get 415), the sidecar-json-last completion-marker invariant documented, assertion of the Worker id after deploy, lifecycle rules read-and-merge, baseline and post-check reads of `jubilab-website` `modified_on`, escaped rendering of prompts and sidecar fields, Range/206 correctness for iOS Safari.
