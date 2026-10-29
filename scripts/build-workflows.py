@@ -27,6 +27,7 @@ DEFAULT_NEGATIVE = "pc game, console game, video game, cartoon, childish, ugly."
 SIGMAS_STAGE1 = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
 SIGMAS_STAGE2 = "0.85, 0.7250, 0.4219, 0.0"
 GUIDE_K = 25  # V2V: number of tail frames used as guide, must be 8n+1
+GUIDE_STRENGTH = 1.0  # V2V: first tuning knob (the Comfy-Org flf2v template uses 0.7)
 GUIDE_WINDOW_S = 4.0  # V2V: only decode the last N seconds of the input
 
 
@@ -113,7 +114,7 @@ def build(mode, two_stage):
         lat = r("inp1")
     elif mode == "v2v":
         g.add("guide1", "LTXVAddGuide", "Guide Stage 1", positive=pos, negative=neg,
-              vae=r("vae"), latent=lat, image=guide, frame_idx=0, strength=1.0)
+              vae=r("vae"), latent=lat, image=guide, frame_idx=0, strength=GUIDE_STRENGTH)
         p1, n1, lat = r("guide1", 0), r("guide1", 1), r("guide1", 2)
 
     # --- stage-1 sampling (video+audio jointly) ---------------------------
@@ -148,7 +149,7 @@ def build(mode, two_stage):
             vid = r("inp2")
         elif mode == "v2v":
             g.add("guide2", "LTXVAddGuide", "Guide Stage 2", positive=pc, negative=nc,
-                  vae=r("vae"), latent=vid, image=guide, frame_idx=0, strength=1.0)
+                  vae=r("vae"), latent=vid, image=guide, frame_idx=0, strength=GUIDE_STRENGTH)
             pc, nc, vid = r("guide2", 0), r("guide2", 1), r("guide2", 2)
         g.add("av2", "LTXVConcatAVLatent", "Join AV Stage 2", video_latent=vid,
               audio_latent=aud)
