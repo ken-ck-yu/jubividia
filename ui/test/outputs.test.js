@@ -132,7 +132,7 @@ describe("GET/HEAD /api/outputs/<key>", () => {
 
   it("404s a missing object and refuses non-GET methods", async () => {
     expect((await get("outputs/2026-10-29/20261029T101010-missing.mp4")).status).toBe(404);
-    expect((await send(`/api/outputs/${KEY}`, { method: "DELETE" })).status).toBe(405);
+    expect((await send(`/api/outputs/${KEY}`, { method: "PATCH" })).status).toBe(405);
   });
 });
 

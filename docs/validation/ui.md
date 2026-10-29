@@ -191,3 +191,85 @@ Coordinator read-only checks (no writes):
 8. **CI.** Should `.github/workflows` (or the root `make test`) also run `npm --prefix ui ci && npm --prefix ui test` and `tests/cloudflare/run.sh`? Today nothing in CI covers the ui.
 9. **Shared cancel.** Either allowed user can cancel the other's running job (shared lock, by design). Accept?
 10. **Test mode.** Make the apply tool's test-mode guard fail safe (for example refuse any `CF_TEST_MODE` value other than `0`/`1`, and ignore `CLOUDFLARE_API_BASE` unless test mode is `1`)? Low risk; hardening.
+
+---
+
+## Branding, delete and prompt guide
+
+Branch `feat/ui-branding`, commits 5ad6dba (masthead and optional photo), 7343b27 (DELETE /api/outputs/<key>), d8db45e (delete UI, prompt guide, `static-rules.mjs`, README). Same hard limits as above: no Cloudflare or RunPod call, `config.env` not read. I did not view `brand.jpg`.
+
+### Verdict: ACCEPT WITH FIXES (two low items, neither blocks deploy)
+
+| # | Fix | Who |
+|---|---|---|
+| B1 | `static-rules.mjs` accepts `<a href="javascript:...">` (also `JaVaScRiPt:` and a tab inside the scheme): it only inspects http(s) and `//` hrefs. Real exposure is nil today (the anchors are static, and the CSP `script-src 'self'` blocks `javascript:` navigation), but the rule claims to be the guard. Reject any href that is not `#`, `/...` or an allowlisted `https://` host. | engineer |
+| B2 | Delete order leaves an unreachable orphan on a partial failure. The sidecar is removed first, so if the `.mp4` or `.jpg` delete then fails the clip is gone from the gallery (no card, no Delete button) and the retry path is only the open dialog; if the user closes it, the `.mp4`/`.jpg` stay forever (no lifecycle rule on `outputs/`). Observed: failing `.mp4` leaves `mp4,jpg`; failing `.jpg` leaves `jpg`. Rare (R2 5xx). Cheap mitigation: have the page keep the dialog open with the error (it does) and document a manual cleanup, or delete mp4 and jpg before the sidecar and accept a card that shows a dead video for the moment. Decision for Ken (Q11). | engineer / Ken |
+
+### 1. What I ran
+
+| Command | Result |
+|---|---|
+| `npm --prefix ui test` with `ui/static/brand.jpg` present | check-static ok (4 static + the ignored photo, 9 src); 10 files, 224 passed (engineer's number) |
+| same with `brand.jpg` moved away (restored afterwards) | 224 passed |
+| `bash tests/cloudflare/run.sh` | 129 passed; with shellcheck on PATH 130 passed (F1 and F2 of the first round are fixed: `apply.sh` is 100755, lint clean) |
+| `make test` | 127 passed |
+| `make lint` | ruff and yaml checks pass |
+| my new `ui/test/validator-delete.test.js` (12 tests, committed with this section) | 12 passed |
+| node script feeding 49 hostile HTML snippets to `checkHtml` | 46 as expected, 3 mismatches (B1) |
+
+### 2. Trying to break `DELETE /api/outputs/<key>`
+
+Code: `index.js` sends DELETE only under `/api/outputs/`, refuses any `%` in the path (400), then `handleDelete` requires `parseDeleteKey` to match `outputs/<date>/<ts>-<id>.(mp4|jpg|json)` with a real-looking month/day/hour/minute/second, timestamp date equal to the folder date, job id `[A-Za-z0-9_-]{1,80}`, no `..`, no `//`, length <= 200. It then deletes only `<base>.json`, `<base>.mp4`, `<base>.jpg`. There is no path from a key to `inputs/` or `state/`: the three deleted keys are always built from a string that already matched the `outputs/` pattern.
+
+Against a Miniflare bucket seeded with two clips, an input, `state/active.json`, `state/usage/<date>.json`, `state/last.json`, a stray `outputs/<date>/notes.txt` and `other/thing.mp4`, with a before/after snapshot (key, size, etag) after every batch:
+- About 75 bad keys, all 400/404/405 and nothing deleted: `inputs/`, every `state/` file, other prefixes, directory and empty keys, missing extension, upper-case extensions, trailing `.`, `.mp4/`, `.mp4x`, `..mp4`, wrong extensions, date/timestamp mismatch, month 13, day 32 and 00, hour 25, minute 60, second 60, 81-character job id, empty id, dotted id, spaces, `%20`, `%2e`, `%2E`, `.%2e`, `%252e`, `%2f`, `%5c`, `%00`, `%0a`, `//` in three positions, leading slash, `..` traversal ending in `state/active.json`, full-width digits and `T`, a Cyrillic letter in the id, a full-width `４` in the extension, Kelvin sign in `json`, NUL inside the key, `state/active.json\0.mp4`.
+- WHATWG URL parsing normalises a few spellings into the same valid key (trailing space, newline or NUL, and `\` as a separator); they delete exactly that one clip and nothing else (asserted). `%2e%2e` is collapsed by the parser before routing, as the engineer noted: `/api/outputs/%2e%2e/state` becomes `/api/state` and `DELETE` there is 405; `/api/outputs/outputs/%2e%2e/state/active.json` becomes `/api/outputs/state/active.json` and is a 400. State survived every case.
+- DELETE on `/api/outputs`, `/api/state`, `/api/state/active.json`, `/api/upload`, `/api/generate`, `/api/status/...`, `/api/cancel/...`, `/`, `/app.js`: 400/404/405, nothing deleted.
+- Method tricks: GET, HEAD, POST, PUT, PATCH, OPTIONS with `X-HTTP-Method-Override`, `X-Method-Override`, `X-HTTP-Method`, `?_method=DELETE`: nothing deleted (overrides are not read). A GET never mutates.
+- Query string and fragment on a valid key do not redirect the delete (`?key=state/active.json#x` deleted only the named clip).
+- A valid delete removes exactly the three files of that clip, answers 204 with `Cache-Control: no-store` and no CORS header, is idempotent (a repeat with another extension is 204), and a never-existing clip is 204 and creates nothing. `state/active.json` and the usage file are byte-identical afterwards, including after attempts to delete them, and with a running reservation (one `/run` only).
+- Gating: no JWT, garbage, `alg:none`, wrong email, expired: 403 with an empty body, nothing deleted. A token without `exp` passes the gate (open item F5 from the first round, unchanged). CSRF: missing `X-Jubividia`, `Origin` only, foreign Origin, `Origin: null`, cross-site and same-site `Sec-Fetch-Site`, form-encoded and `text/plain` content types with a foreign Origin: all 403, nothing deleted, no CORS header; an OPTIONS preflight is 405.
+- Failure and retry: failing each of the three R2 deletes once gives a retryable 500 whose body has no R2 text and no key. Failing `.json` leaves the clip fully intact and listed; failing `.mp4` or `.jpg` leaves the clip already unlisted (sidecar first, as designed) with the remaining files behind it (B2). Retrying cleans it and never touches the other clip.
+- Races: two deletes of the same clip at once both 204; a delete racing two gallery lists: all fine; a 3 MB stream already open while the clip is deleted completed in full in Miniflare (real R2 may cut a stream; not testable here) and later requests are 404.
+- Delete while the job is still running (the key is only known after the job completes, so this needs a guessed key): if the handler has written mp4 and jpg and the user deletes before the sidecar, the sidecar is written afterwards and the gallery lists a card whose video and thumbnail are gone (observed, dangling sidecar). If all three are written after the delete the clip simply reappears (no orphan). An mp4/jpg with no sidecar is invisible and never removed. All require a guessed key and a timing window of milliseconds; informational.
+- The delete route never touches the reservation or the daily counter (see above).
+
+### 3. The page: delete wiring, prompt guide, checker
+
+- Delete button binding (read `app.js` line by line): each gallery card closes over its own `item.key`; the dialog stores `{key, getCard}` and the confirm button reads `S.pendingDelete`; it is modal (no second delete can be opened) and disabled while the request runs; Esc clears the pending state. The result card's Delete uses `S.shownKey`, set by `showResult` for the clip shown; deleting a gallery card whose clip is in the player also clears the player. A 204 removes the card by closure or by `data-key` (no CSS selector built from the key). I found no path that sends a key other than the one on the card. Keys from a finished job come from RunPod output (trusted, not validated in the browser) and the Worker validates them again.
+- Failures: non-204 shows the server message in the dialog and keeps it open; a redirect or non-JSON means session expiry and shows the standard message. Not driven with a click tool beyond opening the dialog; the real-R2 behaviour is untested.
+- Prompt guide: no `innerHTML` (check-static passes); examples are built with `textContent` and "Use this prompt" assigns `.value` and focuses, so markup in an example is inert; examples are constants, the `querySelector` mode comes from constants. First visit: `recall()` returns null when storage throws, so the guide opens every time instead of failing; `store()` failures are swallowed. Fail-safe.
+- CSP is unchanged (Worker headers); the page works with it (screenshot rendered the guide, dialog and masthead with the CSP on; the inline-script, inline-style and handler blocking was proven in the first round).
+- `static-rules.mjs`: all five external hosts accepted only as `https://` anchors with `target="_blank"` and both `noopener` and `noreferrer`. Rejected as expected: subdomain and prefix and suffix lookalikes, `user@host` tricks, `http:`, protocol-relative `//` (even to an allowed host), `ftp:`, single-quoted or unquoted external href, a missing `noopener`, upper-case tags, a newline inside the tag, an evil href after a decoy `href` in `title`, `>` inside an attribute, two anchors with one bad, script src, stylesheet link, img src and srcset, video poster, form action, `formaction`, `ping`, `xlink:href`, meta refresh, iframe, `<base>`, CSS `url()` in a style tag, URLs in comments and text, inline handler, inline style, inline scripts. Accepted: upper-case scheme and host of an allowed site (correct), an allowed host with a port, relative anchors. Mismatches: B1 only. CSS `url()` in `style.css` and absolute URLs in `app.js` are covered by the older checks.
+
+### 4. Branding
+
+- `ui/static/brand.jpg` is git-ignored (`git check-ignore -v` confirms `.gitignore:26`); `git log --all --name-only` shows no image file in any commit; `check-static` fails if any image is tracked or `brand.jpg` is tracked. Tracked files contain no personal path, photo name or source name (grep; the only matches are the guard patterns themselves).
+- The page works without the file: the `<img>` starts hidden, is shown only on `load` and removed on `error`; with the file moved away the suite passes (224) and the screenshot shows the text masthead alone.
+- The Worker serves `brand.jpg` like any static file, so the JWT gate applies (proved for all static paths in the first round and by the Worker pipeline: every path goes through `verifyAccess`).
+- The local `brand.jpg` is 15,327 bytes and contains no `Exif`, `GPS` or `XMP` marker bytes (grep only; I did not open it). Note it will be uploaded to Cloudflare with `deploy`; it is behind Access, not in git.
+- Screenshots: headless Chromium at 390 px wide, light mode: masthead (text only), tagline, strip, guide open on first visit with the steps and examples, and the confirm dialog (Delete this clip?, Cancel and a red Delete) rendered correctly over the page. Dark mode could not be captured: the headless shell ignored the colour-scheme flags (the output was byte-identical), and I did not build an alternative. A gallery card with its Delete button was not in the captured area (the stub's cards sit below the guide); the dialog was opened by clicking one. By CSS inspection `button.danger` uses `var(--err)`, which has a dark-mode value, and the card actions wrap (`flex-wrap`, 40% basis).
+
+### 5. Hygiene
+
+- No secrets, real emails or ids in the diff; nothing changed under `worker/`, `infra/`, `tests/` or `.github/` on this branch (`git diff` against the merge base). README "Deleting clips", "Prompt guide" and "Personalising the page" match the code (exact key form, sidecar-first, 204 on repeat, retryable 500, shared-gallery limitation, five links, brand.jpg before `deploy`, strip EXIF).
+- Docs claim: "a failed run" and delete texts consistent with the dialog wording.
+
+### 6. Cannot be verified here, and what to check before deploying
+
+Cannot verify without a real phone and real R2: real R2 delete semantics for a missing key (Miniflare returns success; the design relies on it for idempotency), a stream cut by a delete, the `<dialog>` element on iOS Safari (it should work from iOS 15.4), tap behaviour of the delete button, dark mode appearance, the first-visit guide with real `localStorage` (Safari private mode throws, handled), how the circular photo looks, and the 95 MB path again.
+
+Redeploy keeps secrets: the Cloudflare docs (Workers, Secrets: "Secrets not included in the file are preserved from the previous version") say secrets persist across versions and are replaced only by `--secrets-file` or `wrangler secret put`; the apply tool's `deploy` passes neither. This is the documented behaviour but I did not run it, so verify it once.
+
+Coordinator checklist before and after the redeploy (read-only):
+1. Before: `git diff` of `ui/` since the first deploy; `ui/static/brand.jpg` is the intended file (or absent); `apply.sh deploy --dry-run`; `preflight` baseline for the other Workers.
+2. Right after `deploy`: read the Worker's secrets list (names only; the five must still be there) before anyone opens the page; `postcheck`; Worker id and `created_on` unchanged; `workers.dev` settings read back.
+3. `verify-access`; then a real login with each address: the page loads, masthead, guide opens once and not again after reload, upload and one small clip, delete one test clip, confirm it disappears from the gallery and the R2 console shows its three objects gone, and `state/` and `inputs/` untouched.
+4. If the secret list is ever empty after a deploy, every request returns 503 (fail closed); re-run `secrets --i-confirmed-access`.
+
+### Numbered questions (this round)
+
+11. Partial-delete orphan (B2): accept a rare orphan `.mp4`/`.jpg` (and note how to remove it by hand), or reorder the deletes?
+12. B1: tighten `static-rules.mjs` to reject any non-allowlisted href scheme (recommended), or leave it because the CSP already blocks `javascript:`?
+13. The "Fast 640x384 quick size" text in the guide (and the size shortcut buttons) still raises Q1 of the first round: keep?
+14. Delete is shared and permanent: either user can delete the other's clips. Acceptable (README says so)?

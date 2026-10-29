@@ -2,6 +2,8 @@
 // Fails when the front end could render server data as markup, runs inline or remote code, or
 // mentions a secret name.
 import { readFileSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { checkHtml, checkCss } from "./static-rules.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,9 +11,33 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (p) => readFileSync(join(root, p), "utf8");
 const list = (d) => readdirSync(join(root, d)).map((f) => join(d, f));
 
-const staticFiles = list("static");
+// brand.jpg is the one optional, git-ignored, binary file (a personal photo; see README "Personalising the page").
+const KNOWN_STATIC = ["static/index.html", "static/app.js", "static/style.css", "static/calc.js"];
+const OPTIONAL_BINARY = "static/brand.jpg";
+const allStatic = list("static");
+const staticFiles = allStatic.filter((f) => f !== OPTIONAL_BINARY);
 const srcFiles = list("src");
 const failures = [];
+
+for (const f of staticFiles) if (!KNOWN_STATIC.includes(f)) failures.push(`${f}: unexpected file in static/`);
+for (const f of KNOWN_STATIC) if (!staticFiles.includes(f)) failures.push(`${f}: missing`);
+try {
+  const tracked = execFileSync("git", ["-C", root, "ls-files", "--", "static"], { encoding: "utf8" });
+  if (/brand\.jpg/.test(tracked)) failures.push("static/brand.jpg is tracked by git: it must stay git-ignored");
+} catch {
+  /* not a git checkout: skip */
+}
+
+// No personal photo or image of any kind may be tracked, and no source path of one may be mentioned.
+try {
+  const all = execFileSync("git", ["-C", root, "ls-files"], { encoding: "utf8" }).split("\n");
+  const imgs = all.filter((f) => /\.(jpe?g|png|gif|webp|heic|heif)$/i.test(f));
+  if (imgs.length) failures.push(`tracked image files: ${imgs.join(", ")}`);
+  const html0 = read("static/index.html") + read("static/app.js") + read("static/style.css");
+  if (/WhatsApp|Zone\.Identifier|jubividia-samples/i.test(html0)) failures.push("static files mention a personal photo source");
+} catch {
+  /* not a git checkout: skip */
+}
 
 const STATIC_FORBIDDEN = [
   [/\binnerHTML\b/, "innerHTML"],
@@ -33,13 +59,8 @@ for (const f of staticFiles) {
   }
 }
 const html = read("static/index.html");
-if (/\son[a-z]+\s*=/i.test(html)) failures.push("index.html: inline event handler attribute");
-if (/\sstyle\s*=/i.test(html)) failures.push("index.html: inline style attribute");
-if (/<script(?![^>]*\ssrc=)[^>]*>/i.test(html)) failures.push("index.html: inline <script>");
-if (/<(script|link|img|video|iframe)[^>]+(src|href)\s*=\s*["']?(https?:)?\/\//i.test(html)) {
-  failures.push("index.html: external resource");
-}
-if (/@import|url\(\s*["']?https?:/i.test(read("static/style.css"))) failures.push("style.css: external resource");
+failures.push(...checkHtml(html)); // inline handlers/styles/scripts; only allowlisted external <a href> links
+failures.push(...checkCss(read("static/style.css")));
 if (/(?<![A-Za-z.])(?:https?:)?\/\/[a-z0-9.-]+\.[a-z]{2,}/i.test(read("static/app.js").replace(/\/\/ .*$/gm, "")) ) {
   failures.push("app.js: contains an absolute URL");
 }

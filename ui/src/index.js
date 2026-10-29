@@ -9,7 +9,7 @@ import { authConfig, verifyAccess } from "./auth.js";
 import { SECURITY_HEADERS, HttpError, bare, errorResponse, json, log } from "./util.js";
 import { handleState, handleGenerate, handleStatus, handleCancel } from "./api.js";
 import { handleUpload } from "./upload.js";
-import { handleGallery, handleOutput } from "./outputs.js";
+import { handleGallery, handleOutput, handleDelete } from "./outputs.js";
 
 const API_PREFIX = "/api/";
 const OUTPUT_PREFIX = "/api/outputs/";
@@ -44,7 +44,12 @@ async function route(request, env, url, me) {
     }
     if (pathname === "/api/outputs") return m === "GET" ? handleGallery(request, env) : methodNotAllowed("GET");
     if (pathname.startsWith(OUTPUT_PREFIX)) {
-      if (m !== "GET" && m !== "HEAD") return methodNotAllowed("GET, HEAD");
+      if (m !== "GET" && m !== "HEAD" && m !== "DELETE") return methodNotAllowed("GET, HEAD, DELETE");
+      if (m === "DELETE") {
+        // Strict: anything that is not exactly a clip key is a 400 and nothing is touched.
+        if (pathname.includes("%")) return json(400, { error: "bad_key", message: "Not a clip key." });
+        return handleDelete(env, pathname.slice(OUTPUT_PREFIX.length));
+      }
       // Keys never need escaping: any percent sign is refused (no %2e%2e, no %2f).
       if (pathname.includes("%")) return json(404, { error: "not_found" });
       return handleOutput(request, env, pathname.slice(OUTPUT_PREFIX.length));

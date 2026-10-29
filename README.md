@@ -279,6 +279,26 @@ Two people (Ken and a second person). Cloudflare Access (one-time PIN, 24 h sess
 
 All subcommands accept `--dry-run` (no Cloudflare write). `teardown` prints the undo steps. Offline tests: `bash tests/cloudflare/run.sh` (fake Cloudflare API on 127.0.0.1; test mode refuses any other host).
 
+### Deleting clips
+
+Every gallery card and the result card has a Delete button. It asks for confirmation in a dialog, then calls `DELETE /api/outputs/<key>`. The Worker accepts only keys of the exact form `outputs/<YYYY-MM-DD>/<YYYYMMDDTHHMMSS>-<jobid>.(mp4|jpg|json)` (job id `[A-Za-z0-9_-]`, at most 80 characters, timestamp date equal to the folder date); anything else, including everything under `inputs/` and `state/`, is a 400 and nothing is touched. It deletes the `.mp4`, then the `.jpg`, and the sidecar `.json` LAST. The gallery lists clips by sidecar, so a clip disappears from the gallery only once everything is removed; if a delete fails part way the card stays, the dialog shows the error, and the user can simply tap Delete again (a retry finishes the job). For a brief moment a card may show while its video is already gone. Repeating a delete returns 204; a partial failure returns a retryable 500 `delete_incomplete`. It needs the Access JWT and the `X-Jubividia` header like every other mutating route. **Known limitation:** the gallery is shared, so either allowed user can delete any clip, and a delete is permanent.
+
+### Prompt guide
+
+Under the prompt box a collapsible "Prompt guide for beginners" explains the five-part prompt structure (action, motion, who and where, camera and light, sound), rules of thumb for a 5 second clip, ready-made examples with a "Use this prompt" button (current mode first), and five reading links. It opens on a first visit only (remembered in `localStorage`, which may be unavailable; no cookies). The only external URLs the page may contain are those five links, enforced by `ui/scripts/static-rules.mjs` (run by `npm test`).
+
+### Personalising the page
+
+The masthead shows the name "JubiVidia", a tagline and, optionally, a small round photo. The photo is **optional and never committed**: the repository is public, so `ui/static/brand.jpg` is in `.gitignore`, and `ui/scripts/check-static.mjs` (run by `npm test`) fails if any image file is tracked. Without the file (a fresh clone) the page simply shows the text brand.
+
+To use your own photo, put it at `ui/static/brand.jpg` **before** `infra/cloudflare/apply.sh deploy` (the file is uploaded with the other static files and, like them, served only after the Access check). Make it square, small and free of metadata (EXIF, GPS). With ffmpeg (for example in the worker image: `docker run --rm -v "$PWD":/w --entrypoint ffmpeg <worker-image> ...`):
+
+```
+ffmpeg -i original.jpg -vf "crop=min(iw\,ih):min(iw\,ih),scale=480:480" -q:v 6 -map_metadata -1 -an -frames:v 1 ui/static/brand.jpg
+```
+
+(Adjust the crop, for example `crop=1080:1080:0:60`, to pick the part of a portrait photo you want.) About 15 to 40 KB is plenty; the page shows it at 60 px.
+
 ### Limits and cost
 
 - One active job at a time (compare-and-swap reservation in R2 `state/active.json`; also refused while RunPod `/health` shows jobs in flight; a timed-out submit keeps the lock; Cancel keeps it until RunPod reports a terminal state).
