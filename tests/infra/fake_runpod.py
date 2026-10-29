@@ -236,7 +236,8 @@ class H(BaseHTTPRequestHandler):
                     rows = [r for r in rows if r["name"].lower() == want]
                 out = {wrap: rows}
                 if coll != "secrets":
-                    out["pagination"] = {"nextCursor": None, "hasNextPage": False}
+                    more = bool(S["flags"].get(f"{coll}_next_page"))
+                    out["pagination"] = {"nextCursor": "c2" if more else None, "hasNextPage": more}
                 return self.send(200, out)
             if m == "POST":
                 return self.create(coll, b)
@@ -425,6 +426,10 @@ class H(BaseHTTPRequestHandler):
         op = parts[2]
         if op == "health":
             fl = S["flags"]
+            if fl.get("health_fail"):
+                if fl["health_fail"] == "garbage":
+                    return self.send(200, raw=b"<html>not json</html>", ctype="text/html")
+                return self.problem(int(fl["health_fail"]), "simulated /health failure")
             w = {"idle": 0, "running": 0, "initializing": 0, "ready": 0,
                  "throttled": int(fl.get("throttled", 0)), "unhealthy": int(fl.get("unhealthy", 0))}
             c = S["health_calls_after_done"]
@@ -458,6 +463,8 @@ class H(BaseHTTPRequestHandler):
             if fl["status_fail"] == "garbage":
                 return self.send(200, raw=b"<html>not json</html>", ctype="text/html")
             return self.problem(int(fl["status_fail"]), "simulated /status failure")
+        if fl.get("queued_forever"):
+            return self.send(200, {"id": jid, "status": "IN_QUEUE"})
         if fl.get("stuck"):
             return self.send(200, {"id": jid, "status": "IN_PROGRESS"})
         if job["polls"] == 1:

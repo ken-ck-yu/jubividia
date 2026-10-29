@@ -567,7 +567,7 @@ out=$(SM --no-r2-check --max-spend lots 2>&1); rc=$?
 tnz "bad --max-spend rejected" "$rc"
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
 out=$(SM --no-r2-check 2>&1); tc "summary reports estimated spend" "$out" "estimated spend: \$"
-tc "summary shows the default cap" "$out" "cap \$1.50"
+tc "summary shows the default cap" "$out" "cap \$3.00"
 
 # Q4: no pinned image tag, no gate
 for bad in "" latest; do
@@ -587,6 +587,63 @@ new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
 ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"https://api.runpod.ai/v2/ep-1/run\"}}}"
 out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
 t "non-loopback requestUrls refused in test mode" 4 "$rc"
+
+# N3: requestUrls.run host is pinned to RunPod domains
+for bad in "https://evil.example/v2/ep-1/run" "https://api.runpod.ai.evil.com/v2/ep-1/run" "http://api.runpod.ai/v2/ep-1/run" \
+  "https://runpod.ai@evil.com/v2/ep-1/run" "https://evilrunpod.ai/v2/ep-1/run" "https://api.runpod.io#@evil.com/run"; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+  ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"$bad\"}}}"
+  out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
+  t "requestUrls $bad refused" 4 "$rc"
+  tc "requestUrls $bad: pin message" "$out" "not a RunPod domain"
+  t "requestUrls $bad: no job submitted" 0 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+done
+for good in "https://api.runpod.ai/v2/ep-1/run" "https://ep-1.api.runpod.io/run"; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+  ctl_tamper "{\"kind\":\"endpoints\",\"add\":{\"id\":\"ep-1\",\"requestUrls\":{\"run\":\"$good\"}}}"
+  out=$(RUNPOD_API_BASE="http://127.0.0.1:$PORT/v2" SM --no-r2-check 2>&1); rc=$?
+  tc "RunPod URL $good passes the pin (then test mode refuses the network)" "$out" "TEST MODE refuses non-loopback"
+  tn "RunPod URL $good is not called a bad domain" "$out" "not a RunPod domain"
+done
+
+# N1: /health failing while /status says IN_QUEUE forever must still stop and cancel
+for mode in 500 garbage; do
+  new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set "{\"queued_forever\":true,\"health_fail\":\"$mode\"}"
+  out=$(SMOKE_HEALTH_FAIL_LIMIT=3 SM --no-r2-check 2>&1); rc=$?
+  t "/health $mode + queued forever -> stop" 3 "$rc"
+  tc "/health $mode message" "$out" "/health failed 3 polls in a row"
+  t "/health $mode: cancel sent" 1 "$(count_calls POST /rt/ep-1/cancel | awk '{print ($1>=1)?1:0}')"
+done
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"queued_forever":true,"health_fail":"500"}'
+out=$(SMOKE_HEALTH_FAIL_LIMIT=100000 SMOKE_JOB_WALL_S=1 SM --no-r2-check 2>&1); rc=$?
+t "wall-clock cap stops a job even when nothing else trips" 3 "$rc"; tc "wall-clock message" "$out" "wall-clock"
+t "wall-clock cap sent a cancel" 1 "$(count_calls POST /rt/ep-1/cancel | awk '{print ($1>=1)?1:0}')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"queued_forever":true}'
+out=$(SMOKE_JOB_WALL_S=1 SM --no-r2-check 2>&1); rc=$?
+t "wall-clock cap with healthy /health and an endless queue" 3 "$rc"
+tc "default wall cap is derived from the execution timeout" "$(grep -c 'JOB_WALL_S=\${SMOKE_JOB_WALL_S:-\$((EXEC_S + 600))}' "$SMOKE")" 1
+
+# N2: the stop message names the failing poll's HTTP status, not the cancel call's
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"status_fail":"500"}'
+out=$(SMOKE_POLL_FAIL_LIMIT=2 SM --no-r2-check 2>&1)
+tc "stop message reports the /status HTTP code" "$out" "last HTTP 500"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"queued_forever":true,"health_fail":"503"}'
+out=$(SMOKE_HEALTH_FAIL_LIMIT=2 SM --no-r2-check 2>&1)
+tc "stop message reports the /health HTTP code" "$out" "last HTTP 503"
+
+# N4: the spend estimate includes a 60 s idle tail per job (about $0.029), so a $0.02 cap trips after the canary
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check --max-spend 0.02 2>&1); rc=$?
+t "idle tail makes a tiny cap trip after one job" 3 "$rc"; tc "tail spend message" "$out" "reached --max-spend"
+t "capped run stopped after the canary" 1 "$(ctl log | pj 'len([x for x in d if x["path"].endswith("/run")])')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check 2>&1); tc "full gate stays under the 3.00 default" "$out" "GATE: PASS"
+
+# N5: status aborts on a second page of pods
+new_fake; full_apply; A pod-up >/dev/null 2>&1
+ctl_set '{"pods_next_page":true}'
+out=$(A status 2>&1); rc=$?
+tnz "status aborts when the pod list has a second page" "$rc"; tc "second-page message" "$out" "more than one page"
 
 new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"default_gen":[310.0]}'
 out=$(SM --no-r2-check 2>&1); rc=$?

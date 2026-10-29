@@ -20,7 +20,7 @@
 # Stops (exit 3) and asks Ken when: the canary shows unresolved secrets or another error; a worker goes
 # Unhealthy; a job stays IN_PROGRESS past 15 min (a cancel is sent); a job waits in the queue with no
 # usable worker (throttled) past 5 min; /status fails 5 polls in a row (cancel sent); estimated spend
-# (worker time x $1.75/hr) reaches --max-spend (default 1.50 USD; cancel sent); cold start > 600 s;
+# (worker time x $1.75/hr) reaches --max-spend (default 3.00 USD; each job also counts a 60 s idle tail; cancel sent); cold start > 600 s;
 # cold-tiny start + warm default gen_time > 700 s; warm gen_time > 300 s.
 # Exit codes: 0 gate passed, 1 gate failed, 2 usage/config, 3 stop-and-ask.
 # Output never contains the API key or R2 secrets (lib.sh redact()).
@@ -39,7 +39,7 @@ POLL_FAIL_LIMIT=${SMOKE_POLL_FAIL_LIMIT:-5}
 MAX_INPROGRESS_S=${SMOKE_MAX_INPROGRESS_S:-900}
 QUEUE_STOP_S=${SMOKE_QUEUE_STOP_S:-300}
 IDLE_WAIT_S=${SMOKE_IDLE_WAIT_S:-600}
-MAX_SPEND=1.50
+MAX_SPEND=3.00
 WORKER_USD_PER_HR=1.75
 COLD_FLAG_S=180
 COLD_HARD_S=600
@@ -67,6 +67,10 @@ need_cfg RUNPOD_API_KEY RUNPOD_ENDPOINT_ID IMAGE_TAG
 valid_image_tag "$(cfg IMAGE_TAG)" || die "IMAGE_TAG must match ^sha-[0-9a-f]{7,}\$ (refusing to run the gate without a pinned image tag)"
 EP=$(cfg RUNPOD_ENDPOINT_ID)
 EXEC_S=$(($(cfg RUNPOD_EXEC_TIMEOUT_MS 900000) / 1000))
+# per-job wall-clock cap: execution timeout plus a margin for queueing and a cold start (cold start hard stop is 600 s)
+JOB_WALL_S=${SMOKE_JOB_WALL_S:-$((EXEC_S + 600))}
+HEALTH_FAIL_LIMIT=${SMOKE_HEALTH_FAIL_LIMIT:-5}
+IDLE_TAIL_S=${SMOKE_IDLE_TAIL_S:-60}   # a worker keeps billing for its idle timeout after each job
 FAILS=()
 NOTES=()
 SPEND_S=0
@@ -79,7 +83,15 @@ EP_URL="$RUN_BASE/$EP"
 http GET "$API_BASE/serverless/$EP"
 if api_ok; then
   run_url=$(json_get requestUrls.run)
-  if [[ $run_url =~ ^(https?://[^[:space:]@#]+)/run$ ]]; then EP_URL=${BASH_REMATCH[1]}; fi
+  if [[ -n $run_url ]]; then
+    # Pin the host: https and a *.runpod.ai / *.runpod.io name only (loopback http in test mode).
+    if [[ $run_url =~ $RUNPOD_URL_RE ]] || { [[ $RUNPOD_TEST_MODE == 1 ]] && [[ $run_url =~ $LOOPBACK_RE ]]; }; then
+      EP_URL=${run_url%/run}
+    else
+      printf '%s: refusing requestUrls.run %s: not a RunPod domain (https *.runpod.ai or *.runpod.io)\n' "$TOOL_NAME" "${run_url%%\?*}" >&2
+      exit 4
+    fi
+  fi
 fi
 unset run_url
 
@@ -98,22 +110,32 @@ cancel_job() { # best effort, stops the spend on a job we are giving up on
   if [[ -n $CUR_JOB ]]; then http POST "$EP_URL/cancel/$CUR_JOB"; fi
 }
 
-tick() { # accumulate worker time while something is billing, then enforce the spend cap
-  local n=$EPOCHREALTIME
-  if ((BILLING)); then
-    SPEND_S=$(awkf -v s="$SPEND_S" -v a="$LAST_TICK" -v b="$n" 'BEGIN{printf "%.4f", s+(b-a)}')
-  fi
-  LAST_TICK=$n
+spend_check() {
   if awkf -v c="$(spend_usd)" -v m="$MAX_SPEND" 'BEGIN{exit !(c>=m)}'; then
     cancel_job
     stop "estimated spend \$$(spend_usd) reached --max-spend \$${MAX_SPEND}."
   fi
 }
 
+tick() { # accumulate worker time while something is billing, then enforce the spend cap
+  local n=$EPOCHREALTIME
+  if ((BILLING)); then
+    SPEND_S=$(awkf -v s="$SPEND_S" -v a="$LAST_TICK" -v b="$n" 'BEGIN{printf "%.4f", s+(b-a)}')
+  fi
+  LAST_TICK=$n
+  spend_check
+}
+
+job_finished_spend() { # conservative: every job also pays the idle tail and up to one more poll interval
+  SPEND_S=$(awkf -v s="$SPEND_S" -v t="$IDLE_TAIL_S" -v p="$POLL_S" 'BEGIN{printf "%.4f", s+t+p}')
+  spend_check
+}
+
 health() { # sets H_UNHEALTHY H_THROTTLED H_IDLE H_RUNNING H_INIT
   http GET "$EP_URL/health"
   H_UNHEALTHY=0 H_THROTTLED=0 H_IDLE=0 H_RUNNING=0 H_INIT=0
   api_ok || return 1
+  [[ -n $(json_get workers) ]] || return 1   # 200 with a non-JSON body is a failure too
   H_UNHEALTHY=$(json_get workers.unhealthy); H_UNHEALTHY=${H_UNHEALTHY:-0}
   H_THROTTLED=$(json_get workers.throttled); H_THROTTLED=${H_THROTTLED:-0}
   H_IDLE=$(json_get workers.idle); H_IDLE=${H_IDLE:-0}
@@ -124,7 +146,7 @@ health() { # sets H_UNHEALTHY H_THROTTLED H_IDLE H_RUNNING H_INIT
 # run_job LABEL INPUT_JSON -> J_STATUS J_ID J_DELAY J_EXEC J_GEN J_COLD J_KEY J_THUMB J_META J_VRAM J_START
 # J_ERR (error text) J_ERRCODE J_FIELDS (names of the /status fields)
 run_job() {
-  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting fails=0
+  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting fails=0 hfails=0 code
   say ""
   say "--- $label: submitting"
   if health; then say "    health: idle=$H_IDLE running=$H_RUNNING initializing=$H_INIT throttled=$H_THROTTLED unhealthy=$H_UNHEALTHY"
@@ -148,8 +170,9 @@ run_job() {
       fails=$((fails + 1))
       warn "status poll failed ($fails/$POLL_FAIL_LIMIT): HTTP $API_STATUS"
       if ((fails >= POLL_FAIL_LIMIT)); then
+        code=$API_STATUS   # the failing poll's status, before the cancel call overwrites it
         cancel_job
-        stop "$label: /status failed $fails polls in a row (last HTTP $API_STATUS). Job $J_ID may still be running; a cancel was sent."
+        stop "$label: /status failed $fails polls in a row (last HTTP $code). Job $J_ID may still be running; a cancel was sent."
       fi
     else
       fails=0
@@ -161,7 +184,16 @@ run_job() {
     fi
     BILLING=0
     if [[ $last == IN_PROGRESS ]]; then BILLING=1; fi
-    if health; then
+    if ! health; then
+      hfails=$((hfails + 1))
+      warn "health poll failed ($hfails/$HEALTH_FAIL_LIMIT): HTTP $API_STATUS"
+      if ((hfails >= HEALTH_FAIL_LIMIT)); then
+        code=$API_STATUS
+        cancel_job
+        stop "$label: /health failed $hfails polls in a row (last HTTP $code), so worker state and the queue can not be watched. Job $J_ID may still be running; a cancel was sent."
+      fi
+    else
+      hfails=0
       ((H_UNHEALTHY == 0)) || stop "$label: a worker is Unhealthy (unhealthy=$H_UNHEALTHY). Job $J_ID may still be billing; cancel it only after Ken agrees."
       waiting=$((H_IDLE + H_RUNNING + H_INIT))
       if ((waiting > 0)); then BILLING=1; fi
@@ -172,6 +204,10 @@ run_job() {
     if ((in_progress_since >= 0 && now - in_progress_since > MAX_INPROGRESS_S)); then
       cancel_job
       stop "$label: job $J_ID stayed IN_PROGRESS for more than ${MAX_INPROGRESS_S}s; a cancel was sent to stop the spend."
+    fi
+    if ((now > JOB_WALL_S)); then
+      cancel_job
+      stop "$label: job $J_ID did not finish within ${JOB_WALL_S}s of wall-clock time (last state '${last:-unknown}'); a cancel was sent."
     fi
     tick
   done
@@ -200,6 +236,7 @@ run_job() {
     say "    error_code field: ${J_ERRCODE:-ABSENT (only the [code] prefix in the error text, if any)}"
   fi
   record_csv "$label"
+  job_finished_spend
 }
 
 record_csv() {

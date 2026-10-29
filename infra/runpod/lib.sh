@@ -38,6 +38,8 @@ RUNPOD_TEST_MODE=${RUNPOD_TEST_MODE:-0}
 # No userinfo (@), fragment (#), backslash, whitespace or anything else a URL parser could
 # reinterpret as a different host.
 LOOPBACK_RE='^http://127\.0\.0\.1:[0-9]{1,5}(/[A-Za-z0-9._~/%:+=,-]*)?(\?[A-Za-z0-9._~/%:+=,&-]*)?$'
+# Hosts a requestUrls value may point to: https, *.runpod.ai or *.runpod.io, optional port and path.
+RUNPOD_URL_RE='^https://([A-Za-z0-9-]+\.)*runpod\.(ai|io)(:[0-9]{1,5})?(/[A-Za-z0-9._~/%:+=,-]*)?/run$'
 CURL_NOPROXY=()   # test mode adds --noproxy '*' so loopback traffic can never go to a proxy
 if [[ $RUNPOD_TEST_MODE == 1 ]]; then CURL_NOPROXY=(--noproxy '*'); fi
 assert_url_allowed() {
