@@ -19,6 +19,38 @@ export function validOutputKey(key) {
   return typeof key === "string" && key.length <= 300 && OUTPUT_KEY_RE.test(key) && !key.includes("..");
 }
 
+// ------------------------------------------------------------------ delete
+
+// Stricter than the read pattern: real calendar-looking date and time, a timestamp that matches the
+// folder date, and a job id limited to what the handler produces (safe_id: [A-Za-z0-9_-], max 80).
+const DELETE_KEY_RE =
+  /^outputs\/(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))\/(\d{8})T(?:[01]\d|2[0-3])[0-5]\d[0-5]\d-[A-Za-z0-9_-]{1,80}\.(?:mp4|jpg|json)$/;
+
+export function parseDeleteKey(key) {
+  if (typeof key !== "string" || key.length > 200 || key.includes("..") || key.includes("//")) return null;
+  const m = DELETE_KEY_RE.exec(key);
+  if (!m || m[1].replaceAll("-", "") !== m[2]) return null;
+  return key.slice(0, key.lastIndexOf("."));
+}
+
+/**
+ * DELETE /api/outputs/<key>: removes the whole clip (sidecar first, then mp4, then jpg). The
+ * sidecar goes first because the gallery lists clips by sidecar: the clip vanishes at once even
+ * if a later delete fails. R2 delete of a missing key succeeds, so a repeat is a 204 too.
+ */
+export async function handleDelete(env, key) {
+  const base = parseDeleteKey(key);
+  if (!base) throw new HttpError(400, "bad_key", "Not a clip key.");
+  for (const ext of ["json", "mp4", "jpg"]) {
+    try {
+      await env.BUCKET.delete(`${base}.${ext}`);
+    } catch {
+      throw new HttpError(500, "delete_incomplete", "The clip could only be partly deleted. Try again.", { retryable: true });
+    }
+  }
+  return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+}
+
 // ------------------------------------------------------------------ gallery
 
 const str = (v, max) => (typeof v === "string" ? v.slice(0, max) : null);
