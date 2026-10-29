@@ -50,6 +50,7 @@ export async function verifyAccess(request, cfg) {
       issuer: cfg.team,
       audience: cfg.aud,
       clockTolerance: CLOCK_TOLERANCE_S,
+      requiredClaims: ["exp"], // a token that never expires is refused
     });
     if (typeof payload.email !== "string") return { ok: false, reason: "no_email_claim" };
     const email = payload.email.trim().toLowerCase();

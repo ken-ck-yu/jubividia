@@ -50,8 +50,20 @@ export function costUsd(seconds, rateUsdPerHr) {
   return (seconds * rateUsdPerHr) / 3600;
 }
 
+// Realistic worst case for one job: the 15 minute run cap, plus GPU boot (about 105 s, measured),
+// plus the idle tail (180 s idle timeout), plus a margin for the scale-down lag seen in the gate
+// runs (about 6 minutes after the last job). One shared constant for page, Worker and README.
+export const BOOT_S = 105;
+export const IDLE_TAIL_S = 180;
+export const SCALE_DOWN_MARGIN_S = 150;
+export const WORST_CASE_S = EXEC_TIMEOUT_S + BOOT_S + IDLE_TAIL_S + SCALE_DOWN_MARGIN_S;
+
 export function worstCaseUsd(rateUsdPerHr) {
-  return costUsd(EXEC_TIMEOUT_S, rateUsdPerHr);
+  return costUsd(WORST_CASE_S, rateUsdPerHr);
+}
+
+export function worstCaseText(rateUsdPerHr) {
+  return `up to about $${(Math.round(worstCaseUsd(rateUsdPerHr) * 100) / 100).toFixed(2)} (15 min run cap + boot + idle)`;
 }
 
 /** Rough warm run time: scales the measured default clip by pixels x frames. */

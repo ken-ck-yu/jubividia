@@ -118,7 +118,7 @@ describe("what is sent to RunPod", () => {
     expect(res.status).toBe(202);
     const j = await res.json();
     expect(j.untested).toBe(true);
-    expect(j.expect.worst_case_usd).toBe(0.44);
+    expect(j.expect.worst_case_usd).toBe(0.65);
     expect(validateParams({ mode: "t2v", prompt: "x", width: 2048, height: 2048, num_frames: 481 }).errors).toEqual([]);
   });
 
@@ -192,6 +192,17 @@ describe("one active job", () => {
     runpod.health.jobs.inQueue = 0;
     runpod.jobs.forEach((j) => (j.status = "COMPLETED"));
     expect((await gen({ mode: "t2v", prompt: "y" })).status).toBe(202);
+  });
+
+  it("resolves a job-less 'reserving' record through /health after 120 s, like 'unknown'", async () => {
+    const rec = (ageMs) => JSON.stringify({ request_id: "dead-request", reserved_at: Date.now() - ageMs, job_id: null, state: "reserving" });
+    await bucket().put(ACTIVE_KEY, rec(60_000));
+    expect((await gen({ mode: "t2v", prompt: "x" })).status).toBe(409); // too young: may still be submitting
+    await bucket().put(ACTIVE_KEY, rec(130_000));
+    runpod.health.jobs.inQueue = 1;
+    expect((await gen({ mode: "t2v", prompt: "x" })).status).toBe(409); // RunPod still has a job
+    runpod.health.jobs.inQueue = 0;
+    expect((await gen({ mode: "t2v", prompt: "x" })).status).toBe(202); // nothing in flight: free
   });
 
   it("keeps the reservation when /run times out or the network fails (ambiguous outcome)", async () => {

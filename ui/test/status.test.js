@@ -163,7 +163,7 @@ describe("GET /api/state", () => {
     expect(s.usage).toMatchObject({ today: 0, cap: 30 });
     expect(new Date(s.usage.resets_at).getUTCHours()).toBe(0);
     expect(s.active).toBeNull();
-    expect(s.limits.worst_case_usd).toBe(0.44);
+    expect(s.limits.worst_case_usd).toBe(0.65);
     expect(s.limits.max_video_bytes).toBe(95_000_000);
     const id = await gen();
     runpod.health.workers.initializing = 1;

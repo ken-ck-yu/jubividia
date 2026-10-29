@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { installFakes, send, makeEnv, clearBucket, runpod, ORIGIN } from "./helpers.js";
-import { validateParams, DEFAULT_RATE_USD_PER_HR, worstCaseUsd, estimateWarmSeconds, isUntested, formatUsd } from "../static/calc.js";
+import { validateParams, DEFAULT_RATE_USD_PER_HR, worstCaseUsd, worstCaseText, estimateWarmSeconds, isUntested, formatUsd } from "../static/calc.js";
 
 beforeEach(async () => {
   installFakes();
@@ -84,9 +84,10 @@ describe("response headers and routing", () => {
 });
 
 describe("shared calculations", () => {
-  it("warm default matches the measurement and the 15 minute worst case is about $0.44", () => {
+  it("warm default matches the measurement and the worst case includes boot and idle (about $0.65)", () => {
     expect(estimateWarmSeconds(1280, 704, 121)).toBe(68);
-    expect(worstCaseUsd(DEFAULT_RATE_USD_PER_HR)).toBeCloseTo(0.4375, 4);
+    expect(worstCaseUsd(DEFAULT_RATE_USD_PER_HR)).toBeCloseTo((1335 * 1.75) / 3600, 4);
+    expect(worstCaseText(DEFAULT_RATE_USD_PER_HR)).toBe("up to about $0.65 (15 min run cap + boot + idle)");
     expect(formatUsd(0.4375)).toBe("$0.44");
     expect(formatUsd(0.033)).toBe("$0.033");
   });

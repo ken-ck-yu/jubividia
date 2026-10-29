@@ -41,6 +41,7 @@ h1 { font-size: 1.3rem; margin: 16px 0 8px; }
 h2 { font-size: 1.1rem; margin: 20px 0 8px; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .muted { color: var(--muted); font-size: 0.9rem; }
+#me { overflow-wrap: anywhere; word-break: break-word; min-width: 0; max-width: 100%; }
 .help { color: var(--muted); font-size: 0.9rem; margin: 6px 0 12px; }
 .mono { font-variant-numeric: tabular-nums; font-family: ui-monospace, Menlo, monospace; }
 .error { color: var(--err); margin: 8px 0; }

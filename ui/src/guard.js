@@ -86,7 +86,9 @@ async function classify(cfg, rec, requestId, now) {
       if (st.status === 200 && isTerminalRunpod(st.body?.status)) return "free";
       return "busy";
     }
-    if (d.state === "unknown" && age > UNKNOWN_RESOLVE_MS) {
+    // A job-less record is either an ambiguous submit ("unknown") or a Worker that faulted between
+    // reserve() and the end of /run handling ("reserving"): both resolve through /health after 120 s.
+    if ((d.state === "unknown" || d.state === "reserving") && age > UNKNOWN_RESOLVE_MS) {
       const h = parseHealth(await runpod.health(cfg));
       if (h && h.inQueue + h.inProgress === 0) return "free";
     }

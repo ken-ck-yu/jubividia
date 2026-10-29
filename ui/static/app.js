@@ -303,11 +303,11 @@ function updateForm() {
     setText("frames-info", `${frames} frames, ${secs} s at ${p.fps} fps`);
   } else setText("frames-info", "");
   if (frames && p.width && p.height && calc.isUntested(p.width, p.height, frames)) {
-    const worst = calc.formatUsd(calc.worstCaseUsd(rate));
+    const worst = calc.worstCaseText(rate);
     warn.textContent =
       `Untested size: ${p.width}x${p.height} x ${frames} frames is beyond the measured 1280x704 x 121. ` +
       `It may take much longer, can fail or run out of memory, and a failed run still bills until it stops. ` +
-      `The run is capped at 15 minutes, about ${worst} at most.`;
+      `The run is capped at 15 minutes; worst case ${worst}.`;
     show(warn, true);
   } else show(warn, false);
 

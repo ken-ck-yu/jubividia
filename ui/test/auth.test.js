@@ -38,6 +38,10 @@ describe("access JWT", () => {
     await expectDenied({ jwt: await mintJwt({ noEmail: true }) });
   });
 
+  it("refuses a correctly signed token that has no exp claim", async () => {
+    await expectDenied({ jwt: await mintJwt({ noExp: true }) });
+  });
+
   it("tolerates a few seconds of clock skew but not minutes", async () => {
     expect((await send("/", { jwt: await mintJwt({ expSeconds: -10 }) })).status).toBe(200);
     expect((await send("/", { jwt: await mintJwt({ expSeconds: -120 }) })).status).toBe(403);

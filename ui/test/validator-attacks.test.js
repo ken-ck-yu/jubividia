@@ -526,10 +526,13 @@ describe("VALIDATOR spend guards", () => {
   it("stale reservations: a fresh job-less reservation blocks (until stale), an old one is replaced", async () => {
     const now = Date.now();
     await bucket().put("state/active.json", JSON.stringify({ request_id: "ghost-aaaa", reserved_at: now - 10 * 60_000, job_id: null, state: "reserving", mode: "t2v" }));
-    const blocked = await gen({}, "after-ghost-12345");
-    console.log("VALIDATOR: 10 min old job-less 'reserving' record ->", blocked.status, "(lock-up window until 37 min if the Worker died between reserve and /run)");
-    expect(blocked.status).toBe(409);
+    // F3 fix: a job-less 'reserving' record older than 120 s resolves through /health (nothing in flight -> free)
+    const resolved = await gen({}, "after-ghost-12345");
+    expect(resolved.status).toBe(202);
+    await bucket().put("state/active.json", JSON.stringify({ request_id: "ghost-cccc", reserved_at: Date.now() - 30_000, job_id: null, state: "reserving", mode: "t2v" }));
+    expect((await gen({}, "after-ghost-34567")).status).toBe(409); // still young: may be submitting
     await bucket().put("state/active.json", JSON.stringify({ request_id: "ghost-bbbb", reserved_at: now - 40 * 60_000, job_id: null, state: "reserving" }));
+    runpod.health.jobs.inQueue = 0; // the earlier fake job is no longer in flight
     expect((await gen({}, "after-ghost-23456")).status).toBe(202);
   });
 
@@ -607,7 +610,7 @@ describe("VALIDATOR spend guards", () => {
     expect(ok.status).toBe(202);
     const body = await ok.json();
     expect(body.untested).toBe(true);
-    expect(body.expect.worst_case_usd).toBeCloseTo(0.44, 2);
+    expect(body.expect.worst_case_usd).toBeCloseTo(0.65, 2);
   });
 
   it("a body that is huge, deeply nested, or not an object", async () => {

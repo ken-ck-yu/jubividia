@@ -277,9 +277,12 @@ All subcommands accept `--dry-run` (no Cloudflare write). `teardown` prints the 
 
 - One active job at a time (compare-and-swap reservation in R2 `state/active.json`; also refused while RunPod `/health` shows jobs in flight; a timed-out submit keeps the lock; Cancel keeps it until RunPod reports a terminal state).
 - `DAILY_CAP` clips per UTC day, default 30, shared, failed attempts count (var in `ui/wrangler.toml`; the page shows the reset time in the viewer's local time).
-- Job policy on every submit: `ttl` 35 min, `executionTimeout` 900000 ms. A run is therefore capped at 15 minutes, about $0.44 at $1.75/hr.
+- Job policy on every submit: `ttl` 35 min, `executionTimeout` 900000 ms. A run is capped at 15 minutes. Realistic worst case per job at $1.75/hr: up to about $0.65 (15 min run cap + GPU boot ~105 s + 180 s idle tail + scale-down lag margin), from one constant in `ui/static/calc.js`.
 - Sizes are free within the handler's bounds (256..2048 per side, multiples of 64, up to 481 frames). Beyond the measured 1280x704x121 the page warns (untested, may fail or run out of memory, a failed run still bills) and shows the worst case. Every finished clip shows `gen_time_s`, peak VRAM and an estimated cost.
 - Uploads: 95 MB for video, 20 MB for images (the page shrinks photos to 2048 px JPEG first). JPEG, PNG, WebP, MP4, MOV only; WebM and HEIC are refused. Chunked upload is a later change.
+- The four "Quick sizes" buttons (landscape, portrait, square, fast) are conveniences that fill width and height. They are not limits.
+- Known limitation: either allowed user can cancel the other's running job (two trusted users; the lock only records a hash of who started it).
+- Local dev: `npm run dev` answers 503 locally (no secrets, no reachable Access JWKS) by design; no bypass exists. Local behaviour is covered by the Vitest suite (`cd ui && npm test`), which mints its own JWTs against a fake JWKS.
 - A warm clip is about 1 to 1.5 minutes; the first clip after idle about 4 to 5 minutes (see the endpoint section).
 
 ### Tests

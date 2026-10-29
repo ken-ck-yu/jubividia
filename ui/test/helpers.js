@@ -40,6 +40,7 @@ export async function mintJwt(opts = {}) {
     signer = "main",
     alg = "RS256",
     noEmail = false,
+    noExp = false,
   } = opts;
   const { privateKey } = await key(signer);
   const claims = noEmail ? {} : { email };
@@ -47,8 +48,8 @@ export async function mintJwt(opts = {}) {
     .setProtectedHeader({ alg, kid: `kid-main` })
     .setIssuedAt()
     .setIssuer(iss)
-    .setAudience(aud)
-    .setExpirationTime(Math.floor(Date.now() / 1000) + expSeconds);
+    .setAudience(aud);
+  if (!noExp) jwt.setExpirationTime(Math.floor(Date.now() / 1000) + expSeconds);
   return jwt.sign(privateKey);
 }
 
