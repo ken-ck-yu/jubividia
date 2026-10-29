@@ -34,14 +34,17 @@ export function parseDeleteKey(key) {
 }
 
 /**
- * DELETE /api/outputs/<key>: removes the whole clip (sidecar first, then mp4, then jpg). The
- * sidecar goes first because the gallery lists clips by sidecar: the clip vanishes at once even
- * if a later delete fails. R2 delete of a missing key succeeds, so a repeat is a 204 too.
+ * DELETE /api/outputs/<key>: removes the whole clip: mp4 first, then jpg, the sidecar .json LAST.
+ * The gallery lists clips by sidecar, so the sidecar being last means a partial failure leaves the
+ * card visible and the user can simply tap Delete again (a retry finishes the job). The reverse
+ * order would leave unlisted files forever (no lifecycle rule on outputs/) with no way to retry.
+ * R2 delete of a missing key succeeds, so a repeat is a 204 too. Brief window: a card may show
+ * while its video is already gone.
  */
 export async function handleDelete(env, key) {
   const base = parseDeleteKey(key);
   if (!base) throw new HttpError(400, "bad_key", "Not a clip key.");
-  for (const ext of ["json", "mp4", "jpg"]) {
+  for (const ext of ["mp4", "jpg", "json"]) {
     try {
       await env.BUCKET.delete(`${base}.${ext}`);
     } catch {

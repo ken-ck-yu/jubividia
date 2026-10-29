@@ -59,15 +59,17 @@ describe("DELETE /api/outputs/<key>", () => {
     expect(await exists(STEM + ".mp4")).toBe(false);
   });
 
-  it("deletes the sidecar FIRST: when the mp4 delete fails the clip is already gone from the gallery and a retry finishes", async () => {
+
+  // The sidecar goes LAST: while any delete fails the card stays listed, so the user can tap Delete again.
+  it.each(["mp4", "jpg", "json"])("a failing %s delete is a retryable 500, the sidecar is still there (unless it is the sidecar), and a retry finishes", async (failExt) => {
     await clip();
     const real = bucket();
     const order = [];
-    let failMp4 = true;
+    let fail = true;
     const BUCKET = {
       delete: async (k) => {
         order.push(k.split(".").pop());
-        if (failMp4 && k.endsWith(".mp4")) throw new Error("boom");
+        if (fail && k.endsWith("." + failExt)) throw new Error("boom SECRET-DETAIL");
         return real.delete(k);
       },
       get: (...a) => real.get(...a),
@@ -77,32 +79,20 @@ describe("DELETE /api/outputs/<key>", () => {
     const env = makeEnv({ BUCKET });
     const res = await del(`${STEM}.json`, { env });
     expect(res.status).toBe(500);
-    const j = await res.json();
+    const text = await res.text();
+    expect(text).not.toContain("SECRET-DETAIL");
+    const j = JSON.parse(text);
     expect(j.error).toBe("delete_incomplete");
     expect(j.retryable).toBe(true);
-    expect(order).toEqual(["json", "mp4"]);
-    expect(await exists(`${STEM}.json`)).toBe(false);
-    expect(await listed()).toEqual([]); // gone from the gallery already
-    expect(await exists(`${STEM}.mp4`)).toBe(true);
-    failMp4 = false;
-    expect((await del(`${STEM}.json`, { env })).status).toBe(204);
-    expect(await exists(`${STEM}.mp4`)).toBe(false);
-    expect(await exists(`${STEM}.jpg`)).toBe(false);
-  });
-
-  it("a failing sidecar delete is a retryable 500 and the other objects are not touched", async () => {
-    await clip();
-    const real = bucket();
-    const BUCKET = {
-      delete: async (k) => {
-        if (k.endsWith(".json")) throw new Error("boom");
-        return real.delete(k);
-      },
-      get: (...a) => real.get(...a), head: (...a) => real.head(...a), list: (...a) => real.list(...a),
-    };
-    const res = await del(`${STEM}.mp4`, { env: makeEnv({ BUCKET }) });
-    expect(res.status).toBe(500);
-    expect(await exists(`${STEM}.mp4`)).toBe(true);
+    // order is mp4, jpg, json and it stops at the first failure
+    expect(order).toEqual(["mp4", "jpg", "json"].slice(0, ["mp4", "jpg", "json"].indexOf(failExt) + 1));
+    expect(await exists(`${STEM}.json`)).toBe(true); // sidecar still present: the card is still listed
+    expect(await listed()).toEqual(["20261029T101010-job_abc-1"]);
+    expect(await exists(`${STEM}.mp4`)).toBe(failExt === "mp4");
+    fail = false;
+    expect((await del(`${STEM}.json`, { env })).status).toBe(204); // retry (even with objects already gone)
+    for (const e of ["json", "mp4", "jpg"]) expect(await exists(`${STEM}.${e}`), e).toBe(false);
+    expect(await listed()).toEqual([]);
   });
 
   it("paginates the gallery correctly after deletes", async () => {

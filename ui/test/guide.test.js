@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import indexHtml from "../static/index.html?raw";
 import appJs from "../static/app.js?raw";
-import { checkHtml, ALLOWED_ANCHOR_HOSTS } from "../scripts/static-rules.mjs";
+import { checkHtml, checkCss, ALLOWED_ANCHOR_HOSTS } from "../scripts/static-rules.mjs";
 
 describe("prompt guide markup", () => {
   it("has the nudge above the prompt box and the details block right under it", () => {

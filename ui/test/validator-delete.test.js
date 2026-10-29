@@ -189,7 +189,7 @@ describe("VALIDATOR delete: ordering, failure and races", () => {
     });
   }
 
-  it("fail each of the three deletes in turn: sidecar goes first, a retry finishes, no detail leaks", async () => {
+  it("fail each of the three deletes in turn: sidecar goes last (card stays listed), a retry finishes, no detail leaks", async () => {
     for (const ext of ["json", "mp4", "jpg"]) {
       await clearBucket();
       await seed();
@@ -202,11 +202,12 @@ describe("VALIDATOR delete: ordering, failure and races", () => {
       const left = (await snapshot());
       const mine = ["json", "mp4", "jpg"].filter((e) => left[`${BASE}.${e}`]);
       console.log(`VALIDATOR: delete failing on .${ext} leaves`, JSON.stringify(mine));
-      if (ext === "json") expect(mine).toEqual(["json", "mp4", "jpg"].filter((e) => true)); // nothing deleted yet
-      // the sidecar is deleted first, so unless json itself failed the clip is already gone from the gallery
+      // B2: order is mp4, jpg, sidecar LAST, so whichever delete fails the sidecar is still there
+      // and the card stays listed (the user can tap Delete again)
+      expect(mine).toContain("json");
       const gal = await (await send("/api/outputs")).json();
       const listed = gal.items.map((i) => i.meta_key).includes(`${BASE}.json`);
-      expect(listed).toBe(ext === "json");
+      expect(listed).toBe(true);
       // retry (no failure now) cleans the rest
       expect((await del(`/api/outputs/${BASE}.jpg`)).status).toBe(204);
       const after = await snapshot();

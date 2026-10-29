@@ -3,7 +3,7 @@
 // mentions a secret name.
 import { readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { checkHtml } from "./static-rules.mjs";
+import { checkHtml, checkCss } from "./static-rules.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -60,7 +60,7 @@ for (const f of staticFiles) {
 }
 const html = read("static/index.html");
 failures.push(...checkHtml(html)); // inline handlers/styles/scripts; only allowlisted external <a href> links
-if (/@import|url\(\s*["']?https?:/i.test(read("static/style.css"))) failures.push("style.css: external resource");
+failures.push(...checkCss(read("static/style.css")));
 if (/(?<![A-Za-z.])(?:https?:)?\/\/[a-z0-9.-]+\.[a-z]{2,}/i.test(read("static/app.js").replace(/\/\/ .*$/gm, "")) ) {
   failures.push("app.js: contains an absolute URL");
 }
