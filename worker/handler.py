@@ -39,6 +39,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 import boto3
@@ -54,10 +55,13 @@ COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_ROOT = os.environ.get("COMFY_ROOT", "/comfyui")
 COMFY_PID_FILE = os.environ.get("COMFY_PID_FILE", "/tmp/comfyui.pid")
 WORKFLOWS_DIR = os.environ.get("WORKFLOWS_DIR", "/runpod-volume/workflows")
-# Must stay below the platform execution timeout (15 min) so the caller gets a
-# readable error instead of a killed job. Uploads may use UPLOAD_GRACE_S more.
-JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "840"))
-UPLOAD_GRACE_S = 30
+# Must stay well below the platform execution timeout (900 s) so the caller gets
+# a readable error instead of a killed job; the remainder is reserved for uploads.
+# Generation budget; the rest of the platform limit is reserved for uploads.
+JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "780"))
+PLATFORM_LIMIT_S = 900  # endpoint execution timeout (infra feature)
+SAFETY_S = 15  # everything (incl. uploads/cleanup) must finish this early
+ATTEMPT_MAX_S = 45  # hard cap for one upload attempt, enforced by a thread join
 COMFY_READY_TIMEOUT_S = int(os.environ.get("COMFY_READY_TIMEOUT_S", "300"))
 INPUT_MAX_BYTES = int(os.environ.get("INPUT_MAX_BYTES", str(500 * 1024 * 1024)))
 POLL_INTERVAL_S = float(os.environ.get("POLL_INTERVAL_S", "1.0"))
@@ -93,14 +97,17 @@ class JobError(Exception):
 
 
 def err(code, message):
-    return {"error": message, "error_code": code}
+    # The code is also prefixed into the text in case RunPod /status drops error_code.
+    return {"error": f"[{code}] {message}", "error_code": code}
 
 
 # --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------
 def _num_ok(v):
-    return not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    return isinstance(v, int) or math.isfinite(v)  # ints of any size are finite
 
 
 def _int(inp, name, default, lo, hi):
@@ -216,9 +223,10 @@ def make_r2_client():
         region_name="auto",  # anything else gives SignatureDoesNotMatch on R2
         config=Config(
             signature_version="s3v4",
-            connect_timeout=10,
-            read_timeout=60,
-            retries={"max_attempts": 3, "mode": "standard"},
+            connect_timeout=5,
+            read_timeout=30,
+            # one boto attempt only: retries are the handler's bounded loop
+            retries={"total_max_attempts": 1, "mode": "standard"},
             # boto3 >= 1.36 adds CRC32 trailers by default, which R2 may reject.
             request_checksum_calculation="when_required",
             response_checksum_validation="when_required",
@@ -252,13 +260,37 @@ def local_input_name(jid, key):
     return f"{jid}_{digest}{ext}"
 
 
+def run_bounded(fn, timeout):
+    """Run fn in a daemon thread; give up after `timeout` seconds."""
+    box = {}
+
+    def target():
+        try:
+            box["v"] = fn()
+        except BaseException as e:  # re-raised in the caller
+            box["e"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"timed out after {timeout:.0f}s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 def upload_retry(fn, hard_deadline):
-    """Run fn up to UPLOAD_TRIES times with backoff, within hard_deadline."""
+    """Up to UPLOAD_TRIES bounded attempts; never runs past hard_deadline."""
     last = None
     for attempt in range(UPLOAD_TRIES):
+        remaining = hard_deadline - time.time()  # checked before EACH try
+        if remaining < 1:
+            last = last or "no time left before the platform limit"
+            break
         try:
-            return fn()
-        except (ClientError, BotoCoreError, Boto3Error) as e:
+            return run_bounded(fn, min(remaining, ATTEMPT_MAX_S))
+        except (ClientError, BotoCoreError, Boto3Error, TimeoutError) as e:
             last = e
             log.warning("upload attempt %d failed: %s", attempt + 1, e)
             wait = UPLOAD_BACKOFF_S * (2 ** attempt)
@@ -331,7 +363,7 @@ def fill_workflow(wf, p, input_name):
     for node in wf.values():
         meta = node.get("_meta")
         title = meta.get("title") if isinstance(meta, dict) else None
-        if title:
+        if isinstance(title, str) and title:
             by_title.setdefault(title, []).append(node)
 
     def put(title, fields, value, required=True):
@@ -382,8 +414,11 @@ def submit(wf):
     if r.status_code != 200:
         code, msg = classify_comfy_error(r.text)
         if code == "comfy_error":
-            code = "workflow_mismatch"
-            msg = f"ComfyUI rejected the workflow: {r.text[:500]}"
+            if r.status_code >= 500:
+                msg = f"ComfyUI server error (HTTP {r.status_code}): {r.text[:300]}"
+            else:
+                code = "workflow_mismatch"
+                msg = f"ComfyUI rejected the workflow: {r.text[:500]}"
         raise JobError(code, msg)
     try:
         return r.json()["prompt_id"]
@@ -396,7 +431,9 @@ def wait_for_result(prompt_id, deadline):
     while time.time() < deadline:
         try:
             r = _comfy_request("GET", f"/history/{prompt_id}", timeout=30)
-            body = r.json() if r.status_code == 200 else {}
+            if r.status_code != 200:
+                raise JobError("comfy_unavailable", f"ComfyUI /history returned HTTP {r.status_code}")
+            body = r.json()
             if not isinstance(body, dict):
                 raise ValueError("history is not an object")
             failures = 0
@@ -503,7 +540,10 @@ def upload_results(s3, stem, mp4, jpg, meta, hard_deadline):
     except JobError:
         for key in done:  # no orphans without a sidecar
             try:
-                s3.delete_object(Bucket=b, Key=key)
+                left = hard_deadline - time.time()
+                if left < 1:
+                    break
+                run_bounded(lambda k=key: s3.delete_object(Bucket=b, Key=k), min(left, 10))
             except Exception:  # best effort
                 log.warning("could not delete orphan %s", key)
         raise
@@ -553,7 +593,7 @@ def run_job(job):
             "height": p["height"], "num_frames": p["num_frames"], "fps": p["fps"],
             "gen_time_s": gen_time, "cold": cold,
         }
-        upload_results(s3, stem, mp4, jpg, meta, deadline + UPLOAD_GRACE_S)
+        upload_results(s3, stem, mp4, jpg, meta, t0 + PLATFORM_LIMIT_S - SAFETY_S)
 
         return {
             "v": CONTRACT_VERSION, "key": stem + ".mp4", "thumb_key": stem + ".jpg",

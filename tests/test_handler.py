@@ -355,7 +355,8 @@ def test_a5_client_timeouts_and_checksums(monkeypatch):
                        R2_SECRET_ACCESS_KEY="s", R2_BUCKET="b").items():
         monkeypatch.setenv(k, val)
     cfg = handler.make_r2_client().meta.config
-    assert cfg.connect_timeout == 10 and cfg.read_timeout == 60
+    assert cfg.connect_timeout == 5 and cfg.read_timeout == 30
+    assert cfg.retries["total_max_attempts"] == 1  # botocore max_attempts=1 would still mean 2 tries
     assert cfg.request_checksum_calculation == "when_required"
     assert cfg.response_checksum_validation == "when_required"
 
@@ -467,3 +468,63 @@ def test_q14_titled_output_wins_and_multiple_rejected(env):
     env.state["history"]["pid"]["outputs"]["3"]["images"][0]["type"] = "temp"
     (env.comfy / "output" / "b.mp4").write_bytes(b"b")
     assert "error" not in handler.handler({"id": "j3", "input": v()})
+
+
+# ---- second fix round -----------------------------------------------------
+def test_a5_stalled_upload_is_bounded(monkeypatch):
+    import time
+    monkeypatch.setattr(handler, "ATTEMPT_MAX_S", 0.3)
+    monkeypatch.setattr(handler, "UPLOAD_BACKOFF_S", 0.05)
+    t = time.time()
+    with pytest.raises(handler.JobError) as e:
+        handler.upload_retry(lambda: time.sleep(30), t + 5)
+    assert e.value.code == "upload_failed" and time.time() - t < 3  # 3 x 0.3 s, not 3 x 30 s
+
+
+def test_a5_deadline_checked_before_each_try(monkeypatch):
+    import time
+    calls = []
+    with pytest.raises(handler.JobError) as e:
+        handler.upload_retry(lambda: calls.append(1), time.time() - 1)
+    assert calls == [] and e.value.code == "upload_failed"
+
+
+def test_a5_total_upload_never_exceeds_hard_deadline(monkeypatch):
+    import time
+    monkeypatch.setattr(handler, "ATTEMPT_MAX_S", 10)
+    monkeypatch.setattr(handler, "UPLOAD_BACKOFF_S", 0.05)
+    t = time.time()
+    with pytest.raises(handler.JobError):
+        handler.upload_retry(lambda: time.sleep(30), t + 1.5)
+    assert time.time() - t < 2.5
+
+
+def test_b2_persistent_history_500_ends_in_comfy_unavailable(env):
+    env.state["hist_resp"] = Resp(500, text="boom")
+    out = handler.handler({"id": "j", "input": v()})
+    assert out["error_code"] == "comfy_unavailable" and "500" in out["error"]
+
+
+def test_b1_huge_integer_is_bad_input():
+    huge = int("9" * 400)
+    for f in ("width", "fps", "seed", "num_frames", "duration"):
+        assert code_of(v(**{f: huge})) == "bad_input"
+
+
+def test_b3_prompt_500_not_workflow_mismatch(env):
+    env.state["post"] = Resp(500, text="internal error")
+    assert handler.handler({"id": "j", "input": v()})["error_code"] == "comfy_error"
+    env.state["post"] = Resp(400, text="bad graph")
+    assert handler.handler({"id": "j", "input": v()})["error_code"] == "workflow_mismatch"
+
+
+def test_b3_list_title_is_workflow_mismatch(env):
+    wf = json.loads(json.dumps(WF))
+    wf["1"]["_meta"]["title"] = ["PROMPT"]
+    (env.wfdir / "t2v.json").write_text(json.dumps(wf))
+    assert handler.handler({"id": "j", "input": v()})["error_code"] == "workflow_mismatch"
+
+
+def test_q1_error_text_prefixed_with_code(env):
+    out = handler.handler({"id": "j", "input": v(mode="x")})
+    assert out["error"].startswith("[bad_input] ")
