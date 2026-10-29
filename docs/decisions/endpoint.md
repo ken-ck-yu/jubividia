@@ -349,3 +349,14 @@ Carried over as Ken's decision. Evidence refreshed above: four DCs list the GPU,
 4. **Clone pin**: OK to pin the pod's clone to an explicit commit sha from `config.env` (recommended)?
 5. **Stock hedge**: record US-IL-1 and US-KS-2 as other STANDARD-volume DCs that list the GPU (all LOW now). Do you want a second volume only after the gate shows real throttling (recommended), and is a global-volume timing experiment of interest later?
 6. **VRAM pass line**: accept "no OOM, no offload, second warm default job within 10% of the first" as the pass test, with 46 GB as a report-only number?
+
+## Ken's decisions, round 2 (2026-10-29, answers to the reviewer's questions)
+
+These win over everything above, including the earlier "Ken's decisions and corrections" section.
+
+1. **Gate order:** yes. The cheap missing-input failure job runs FIRST as the secret/R2 canary, and one cold default-size clip job is added at the end of the gate (about $0.4-0.7).
+2. **Timeout:** keep 900 s execution timeout as a spend-safety choice. RunPod's real range is 5 s to 7 days; the `timeout` field is in milliseconds; read-back is mandatory. SPEC and README wording that calls 900 s a platform limit is corrected (SPEC edit limited to that wording). `handler.PLATFORM_LIMIT_S` becomes a documented constant tied to the chosen execution timeout.
+3. **HF token on the temp pod:** passed as a temporary RunPod SECRET reference (`{{ RUNPOD_SECRET_hf_token_tmp }}`) that `pod-down` deletes. This is a deliberate, documented exception to "never auto-delete secrets", scoped to that one secret name. The volume and the two R2 secrets are never auto-deleted. The token stays read-only and is rotated afterwards.
+4. **Clone pin:** the temp pod's git clone is pinned to an explicit commit from `config.env` (`GIT_REF`; a default is set explicitly in `config.env.example`, never `HEAD`).
+5. **Second volume** at US-IL-1 or US-KS-2 waits until the gate shows real throttling.
+6. **Gate pass test:** no OOM, no offload, and a second warm default job within 10% of the first. 46 GB peak VRAM is report-only. Cold start is defined as `delayTime + executionTime` of the first job minus its generation time (`gen_time_s`). Added stop conditions: a worker goes Unhealthy, or a job stays IN_PROGRESS past 15 min.
