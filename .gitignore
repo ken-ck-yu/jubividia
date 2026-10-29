@@ -12,3 +12,11 @@ __pycache__/
 *.tfstate
 *.tfstate.*
 .DS_Store
+.scratch/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.scratch/
+.venv/
+.pytest_cache/
+.ruff_cache/
