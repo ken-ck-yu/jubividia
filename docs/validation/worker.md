@@ -143,3 +143,84 @@ Required fixes before merge:
 11. Add `COMFY_HOST`, `COMFY_ROOT`, `POLL_INTERVAL_S` to `config.env.example`.
 
 Not blocking the code, but blocking acceptance as "done": answers to Q1, Q2, Q3, Q5, Q6, Q8, Q9. The gating GPU run (int8-convrot on RTX 6000 Ada, cold and warm timing, peak VRAM, first real R2 upload, and a real FAILED job to see what `/status` returns) has not been executed and must happen once `models`, `workflows` and `endpoint` exist. Until then, this feature is validated only as far as a CPU-only container and fakes can take it.
+
+
+---
+
+# Re-check (2026-10-29, after commits 3be0a61, ec1c0e0, d9cf321)
+
+Re-validated by the validator agent at `feat/worker` @ `d9cf321`. Nothing is taken from the engineer's report. Each fix was exercised against real behaviour: the real handler, **real boto3 1.43.85 and real `requests`** against throw-away local HTTP servers on 127.0.0.1 (a fake S3 and a fake ComfyUI), and the real runpod SDK inside the image. The scripts are kept outside the repo (`$CLAUDE_JOB_DIR/tmp/re{1..5}.py`). No RunPod or Cloudflare endpoint was contacted; `config.env` was not read.
+
+## What I ran
+
+| Command | Outcome |
+|---|---|
+| `make test` | 90 passed. Also under `unshare -rn` (no network): 90 passed |
+| `make lint` | clean |
+| `make build` | cached no-op. I then ran `docker build --no-cache -t ltx25-worker:val2 worker`: succeeded (`uv pip install` honoured `-c constraints.txt`, transformers 5.21.0 as before, torch-family `diff` empty, CPU `--quick-test-for-ci` ok). Tag removed afterwards |
+| `pip freeze` of the fresh `--no-cache` image vs `worker/constraints.txt` | byte-identical, so the freeze is faithful and reproducible. No `@ file://` or editable lines |
+| `make smoke` on the cached image and on the `--no-cache` image | 19 PASS, 0 FAIL on both |
+| `/handler.py` in the image vs `worker/handler.py` | identical md5 |
+| runpod SDK 1.12.0 inside the image, `--test_input`, `--network none` | `config_error` (no env) and `bad_input` arrive as `{"output": {"error_code": ...}, "error": "..."}`: the new codes survive the SDK exactly like the old ones. This is only the SDK-side shape; the platform `/status` shape is unverified (Q1) |
+| Secret scan (working tree, `git log -S AKIA`), tracked modes, ignore rules | No secrets (the only `AKIA` hit in history is my own report text). All tracked files are 100644; the repo needs no executable bit (`/handler.py` is run via `python`, `start.sh` belongs to the base). `config.env`, `.venv`, `__pycache__` are ignored |
+
+## Defects, one by one (A-n from the first report)
+
+| ID | Status | Evidence |
+|---|---|---|
+| A-1 real `S3UploadFailedError` | **Fixed** | Fake S3 answering 403 to PUT: `upload_failed` after 3 tries, output file removed. 503 SlowDown, connection refused and 403 on the json also give `upload_failed` |
+| A-2 bucket checked late | **Fixed** | `R2_BUCKET` unset: `config_error` in 0.0 s, 0 requests to ComfyUI, 0 to S3 |
+| A-3 `cold` flag | **Fixed** | `_first_job` stays true after `bad_input`, after an `input_fetch` failure and after a rejected prompt; the next real job reports `cold: true` |
+| A-4 duration x fps cap | **Fixed** | 20 s x 60 fps: `bad_input` (1201 > 481); 20 s x 24 fps = 481 accepted; 20 s x 23 = 457; `num_frames` 489 rejected |
+| A-5 timeouts | **Partly fixed, hole remains** | Connect/read timeouts 10/60 s are set and both `when_required` checksum options are set (no `x-amz-checksum` or trailer headers on the PUTs the server saw). But a stalled endpoint (accepts the connection, never answers; the realistic R2 brownout) made **one** mp4 upload take **733 s** before `upload_failed` (server saw 12 PUT attempts: 3 handler tries x botocore/s3transfer retries x 60 s). The "30 s grace" is only checked between tries, never inside one. A job that generated for 300 s would exceed RunPod's 900 s execution limit and be killed instead of returning a readable error. See B-4 |
+| A-6 long basename | **Fixed** | 300-char and 90 CJK-char basenames pass. Local name is `<jid>_<sha1[:8]><sanitised ext>`, independent of key length; same basename in different folders gives distinct names |
+| A-7 ComfyUI failure modes | **Fixed, with notes** | Port closed plus dead PID in `/tmp/comfyui.pid`: `comfy_unavailable` in 0.0 s (was 300 s). PID that dies mid-poll: fails within 1 s. Server that vanishes mid-job with no pid file: `comfy_unavailable`. Non-JSON history, list-shaped history, missing `prompt_id`: `comfy_bad_response`. 400 with OOM or "not in list": `oom` / `model_missing`. **PID mechanism in the real image**: with `bash` as PID 1 (as under `start.sh`) a dead background child is reaped, so `os.kill(pid, 0)` raises `ProcessLookupError` (checked inside the image). Under a non-reaping parent (my harness) a zombie looks alive, but that is not the deployed layout. Residual: B-2, B-3 |
+| A-8 NaN/inf | **Fixed for NaN/inf/1e400; huge ints escape** | Every numeric field with NaN, inf, -inf, 1e400 gives `bad_input`; JSON `NaN` end to end gives `bad_input`. A 309+ digit integer (valid JSON) still raises `OverflowError` from `math.isfinite` and returns `comfy_error: unexpected worker error` (B-1) |
+| A-9 non-API workflows | **Fixed** | UI format, top-level list, `{}`, null `inputs`, non-dict node, missing `class_type`, invalid JSON, missing file: all `workflow_mismatch` with a readable message, 0 S3 GETs, 0 ComfyUI posts. Residual: a node whose `_meta.title` is a list or dict is unhashable and escapes as `comfy_error` (B-3, cosmetic) |
+| A-11 INPUT/SEED fields | **Fixed** | `LoadImage.image` (i2v) and core `LoadVideo.file` (v2v) work; a custom node with `video` works; `RandomNoise.noise_seed` works for SEED; a node with both `image` and `file` only gets the first listed; a wrong class gives `workflow_mismatch` naming the tried fields; duplicate titles are all filled; a link-valued input (`["12", 0]`) on WIDTH is silently replaced by the constant (acceptable, worth knowing). Whether the real LTX 2.5 example graphs use these classes is for `workflows` to confirm |
+| A-12 orphan mp4 | **Fixed** | jpg 403 or json 403: mp4 (and jpg) are deleted (DELETE seen on the server, bucket empty afterwards). If DELETE also fails the orphans remain and a warning is logged (best effort, as designed): the gallery should still list by `.json` |
+
+## Questions of the first report
+
+- **Q3 (R2 checksums)**: code fixed. The gating test on real R2 is still needed (README now says so).
+- **Q5 (unpinned transitive deps)**: fixed. `constraints.txt` is identical to a fresh build's freeze. It pins transformers 5.21.0 / huggingface_hub 2.3.0; that Gemma 4 loads with them is still unproven.
+- **Q6 (retry idempotency)**: settled by documentation. Verified: a retry with the same job id gets new keys (`...T013157-same.mp4` vs `...T013158-same.mp4`); a failed attempt cleans up its own uploads. README warns the UI.
+- **Q7 (liveness)**: fixed (A-7).
+- **Q13 (order)**: fixed. Workflow load/fill runs before any S3 call (0 GETs on every workflow error).
+- **Q14 (which mp4)**: fixed. A node titled `OUTPUT` wins (two mp4s: the OUTPUT node's file was the one chosen); two videos without `OUTPUT`: `workflow_mismatch`; `OUTPUT` node with no mp4: `output_missing`; temp-only: `output_missing`; one file listed under both `images` and `gifs`: de-duplicated and accepted; subfolders work. After the ambiguous or `output_missing` outcomes the extra mp4 files stay in ComfyUI's `output/` on the worker's ephemeral disk (B-5).
+- **Q1, Q2, Q4, Q8, Q9, Q10, Q11, Q12**: not code fixes; still open (below). Q12: the branch is still based on `bf915fb`, `main` is at `933671c`, and `.claude/agents/*` is still tracked here.
+
+## New findings in the rewrite
+
+- **B-1 (low)**: integers of 309+ digits in any numeric field raise `OverflowError` and return `comfy_error` instead of `bad_input`. No cost, wrong code. Fix: guard `_num_ok` / compare ints before the float test.
+- **B-2 (low)**: if ComfyUI answers `GET /history/<id>` with a persistent non-200 (for example 500), `body` becomes `{}`, `failures` is reset and the loop polls until the 840 s deadline, then reports `timeout`. Only non-JSON and connection errors count as failures. Fix: count non-200 as a failure.
+- **B-3 (cosmetic)**: a `/prompt` reply with status 500 is reported as `workflow_mismatch: ComfyUI rejected the workflow` (every non-200 that is not OOM/model-missing is). A 5xx is a server fault, not a template fault. Also the unhashable `_meta.title` case.
+- **B-4 (= A-5, needs a fix)**: upload time is not bounded under a stalled R2. Suggested fix: `retries={"max_attempts": 1}` in the boto `Config` (the handler already retries 3 times), and check the deadline before each try. Re-measure with a stalled server; target a worst case well under the 900 s limit even after a long generation.
+- **B-5 (cosmetic)**: extra mp4 files left in `/comfyui/output` after `workflow_mismatch` / `output_missing`.
+- **B-6 (low)**: `config.env.example` now lists `JOB_TIMEOUT_S`, `COMFY_READY_TIMEOUT_S`, `INPUT_MAX_BYTES`, `WORKFLOWS_DIR`, `COMFY_HOST`, `COMFY_ROOT`, `POLL_INTERVAL_S` and the four R2 variables. `COMFY_PID_FILE` (read by the handler, default `/tmp/comfyui.pid`, which matches `start.sh`) is missing.
+- Retry loop vs job deadline: generation is bounded by the 840 s deadline; uploads by `deadline + 30` only between tries (A-5); the readiness wait uses `min(deadline, 300 s)`. `fetch_input` is not bounded by the deadline, only by boto's timeouts. After a very slow input download, `wait_for_comfy` reports "did not become ready" immediately if the deadline has passed (misleading message, harmless).
+- Orphan cleanup works (verified for mp4/jpg when a later upload fails). On success, the output file, the input file and the temp dir are all gone after each job.
+- The INPUT/SEED candidate tuples behave as the README table says; the 481-frame cap holds on both paths.
+
+## Cannot be verified without a GPU, models, R2 or RunPod
+
+- Any real generation; int8-convrot loading and speed on the RTX 6000 Ada (sm_89, torch 2.11+cu128; `comfy_kitchen` says its optimized ops need cu130); peak VRAM; cold and warm timings (SPEC criteria 2 and 3). This is Ken's decision-8 gate and it has not been run.
+- That Gemma 4 and the LTX nodes load under transformers 5.21.0 with real weights.
+- Real R2: that the `when_required` options make uploads succeed; CORS and permissions; `region_name="auto"` signing; real R2 timeout behaviour (the A-5 numbers come from a local stall).
+- That RunPod's `/status` for a FAILED job returns `output.error_code` (Q1). Only the SDK-side shape is verified.
+- The real ComfyUI wording for OOM and missing models (the classifier is tested on my sample strings), the real `/history` shape for the LTX graph, and whether the mp4 has audio.
+- The `start.sh` GPU preflight and network-volume behaviour; the PID file semantics are verified only with a bash-PID-1 emulation, not the real `start.sh` on RunPod.
+- GitHub Actions: disk and GHA cache with a 24.75 GB image, GHCR push and public visibility (workflow only linted).
+
+## Open (not code)
+
+Q1 (does the platform expose `error_code`?), Q2 (int8-convrot warm-time/VRAM threshold), Q4 (accept losing a finished clip on upload failure?), Q8 (704 default), Q9 (acknowledge base 5.10.0 instead of 5.11.0), Q10 (CI size), Q11 (SPEC §7 and CLAUDE.md stale; merge conflicts with `main`), Q12 (rebase).
+
+## Re-check verdict: ACCEPT WITH FIXES
+
+All twelve defects and the engineer-owned questions are fixed or properly documented. The tests are real (my independent real-boto3 and real-HTTP runs agree with them), the image rebuilds reproducibly with the freeze, and there are no secrets. Remaining required fixes (small, engineer):
+1. **A-5 / B-4**: bound the upload time (boto `max_attempts` 1 and a deadline check before every try), then re-measure with a stalled server.
+2. **B-2**: count non-200 `/history` replies as failures.
+3. **B-6**: add `COMFY_PID_FILE` to `config.env.example`.
+
+Optional (low): B-1, B-3, B-5. The gating GPU run and the first real R2 upload remain mandatory before the feature can be called done.
