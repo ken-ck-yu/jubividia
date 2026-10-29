@@ -237,3 +237,17 @@ Prices are from today's reads: serverless RTX 6000 Ada $1.75/hr ($0.000486/s); n
 Gate subtotal: expected about $0.8-$1.2; worst case about $2.4 with one worker (steps 5-9 at their worst), $4.7 if a second worker is allowed to cold start in parallel (max 2) or a crash loop doubles the start time.
 
 **Worst-case spend for the whole first run:** volume $5.60 (one month) + GPU pod fallback $0.99 + gate with two workers $4.67 + one full repeat of the gate after a worker fix $2.33 = about **$13.6**. Expected: about **$7** ($5.60 volume + roughly $1 gate + pennies for the pod). The endpoint's `workers.max` and the per-step caps above are the guardrails; the coordinator should stop at the first stop-and-ask condition rather than retry.
+
+## Ken's decisions and corrections (2026-10-29, after the architect pass)
+
+Where this section conflicts with the text above, this section wins.
+
+- **Q1 image pin is resolved; the "no image tag" problem was a stale-base artefact.** All four PRs (#1-#4) are merged on `main` and the `build-worker` run 40860444812 succeeded. The image to pin is **`ghcr.io/ken-ck-yu/ltx25-worker:sha-f637c09`** (digest `sha256:b027d845f84cde4504357bfd8241351c71fab9bc46ef26c56819e2668e2f83f0`, same as `latest`, checked anonymously, so the package is public). `apply.sh` must still reject `latest` and anything not matching `^sha-[0-9a-f]{7,}$`. This branch is rebased on the merged `main`.
+- **Q2:** proceed with the RTX 6000 Ada only and accept the LOW stock for the gate (option a). No L40S / EU-NL-1 move now.
+- **Q3:** exclude `NVIDIA L40`, `NVIDIA L40S` and the `MIG 2g.48gb` type from the pool for the gate.
+- **Q4:** option (a): add `peak_vram_mb` to the handler output and sidecar JSON by sampling `nvidia-smi --query-gpu=memory.used` in a thread during the run (small worker change with a unit test; rebuilds the image, so the endpoint must then pin the NEW `sha-<short>` tag from the build of the merge of this change; the engineer states this in the README and apply.sh reads the tag from config.env, never hardcoded).
+- **Q5 thresholds** (provisional, they only trigger "stop and ask Ken", never an automatic spend): pass if int8-convrot loads on the 5.10.0 base, the default 1280x704x121 clip completes without OOM with peak VRAM <= 46 GB, warm `gen_time_s` <= 300 s, cold start <= 180 s (flag only) / 600 s (hard stop), audio present.
+- **Q6 (balance): still pending from Ken.** No payment method was linked and no balance confirmed as of this note. The coordinator makes NO billable call until Ken confirms a payment method and funding (about $15 is the proposed first-run ceiling; worst case about $13.6).
+- **Q7, Q8** as the architect proposed (idle 60 s; set timeout 900000 and verify by read-back, the handler's own JOB_TIMEOUT_S 780 s stays inside it). **Q9:** if the CPU pod is unavailable, stop and ask.
+- The FP8 comparison and the model-download of any extra files are NOT part of this feature unless Ken asks.
+- Stock fluctuates (US-WA-1 RTX 6000 Ada read as MEDIUM earlier today and LOW in the architect's read); the coordinator re-reads capacity immediately before each billable step and states it.
