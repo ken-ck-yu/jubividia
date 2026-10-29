@@ -1,0 +1,14 @@
+config.env
+.env
+.env.*
+!.env.example
+*.safetensors
+*.gguf
+node_modules/
+.wrangler/
+__pycache__/
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
+.DS_Store
