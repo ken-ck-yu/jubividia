@@ -511,6 +511,13 @@ class H(BaseHTTPRequestHandler):
             job["result"] = {"id": jid, "status": "COMPLETED", "output": out,
                              "delayTime": 45000 if cold else 200,
                              "executionTime": int((gen + 3) * 1000)}
+            bm = fl.get("bad_metric")   # {"name": delayTime|executionTime|gen_time_s, "mode": missing|null|empty|text}
+            if bm:
+                holder = out if bm["name"] == "gen_time_s" else job["result"]
+                if bm["mode"] == "missing":
+                    holder.pop(bm["name"], None)
+                else:
+                    holder[bm["name"]] = {"null": None, "empty": "", "text": "n/a"}[bm["mode"]]
         return self.send(200, job["result"])
 
 

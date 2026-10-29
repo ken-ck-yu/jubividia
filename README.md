@@ -188,29 +188,60 @@ RTX 6000 Ada only (`NVIDIA RTX 6000 Ada Generation`: pool `ADA_48_PRO` minus `NV
 
 `scripts/smoke-job.sh` (add `--no-r2-check` if `aws`/`ffprobe` are not installed; the audio and R2 checks are then unverified). It uses `/run` + `/status` + `/health` + `/cancel` only, against the run URL in the endpoint's `requestUrls` (fallback `https://api.runpod.ai/v2/<id>`). **`--max-spend USD` (default 3.00 for the full gate)** is an overall guard: estimated worker time times $1.75/hr, conservatively adding a 60 s idle tail and one poll interval per job; when reached it cancels the running job and exits 3. The run URL must be https on `*.runpod.ai` or `*.runpod.io` (otherwise exit 4). Every job also has a wall-clock cap (execution timeout plus 600 s, `SMOKE_JOB_WALL_S`) that cancels it and exits 3, and `/health` failing 5 polls in a row (`SMOKE_HEALTH_FAIL_LIMIT`) does the same, so a bad health route can not leave a job queued unwatched. Order: (1) canary: a missing-input i2v job, which needs good R2 secrets but never loads models. It passes when the error is `[input_fetch] input not found` (a missing key failing inside input_fetch proves the R2 credentials resolved), with a recorded note if `/status` has no separate `error_code` field; any other error (`could not fetch input`, `config_error`, auth, no prefix) stops the gate before any model job; (2) cold tiny t2v; (3) warm tiny (a new seed; every job uses a different seed so none is a ComfyUI cache hit); (3b) `repeat-same`: the exact same request as warm-tiny again, which must complete with a NEW output key (it checks the unique per-run OUTPUT prefix on the real worker); (4) warm default 1280x704x121; (5) second warm default; (6) wait for scale to zero, (7) cold default clip (the real first-after-idle path). **Pass** = no OOM, no offload, the second warm default job within 10% of the first, audio present, the three R2 objects exist. 46 GB peak VRAM is report-only. Offload cannot be seen from job data: read the worker logs. **Cold start** = worker start + model-load overhead, where worker start = `delayTime + executionTime - gen_time_s` and model-load overhead = `gen_time_s` of the cold job minus `gen_time_s` of the matching warm job (cold-tiny vs warm-tiny, cold-def vs warm-def). The model load runs inside the first job, so it is part of `gen_time_s`; the first real run printed 2.4 s for a load of about 120 s with the old formula. The 180 s flag and 600 s hard stop apply to this sum. The first-ever cold start can include a billed 24.75 GB image pull, so judge the second. Each job is appended to `docs/validation/endpoint-timings.csv`. It **stops and asks Ken** (exit 3) when a worker goes Unhealthy, a job stays IN_PROGRESS past 15 min (a cancel is sent), a job sits in the queue throttled past 5 min, cold start exceeds 600 s, cold-tiny start plus warm default gen time exceeds 700 s, or warm default gen time exceeds 300 s. It also stops (cancelling the job) if `/status` fails 5 polls in a row (401, 500, not JSON); the in-progress, unhealthy and queue checks keep running while polls fail. Do not work around a stop.
 
+#### Interpreting a run
+
+A passing run shows all of these in the output (and the CSV):
+- `canary OK`, then every model job `COMPLETED`.
+- `repeat-same completed with a new output key`, plus (with R2 checks on) `repeat-same mp4 exists: <n> bytes` and `repeat-same sidecar: same prompt and seed ..., job_id ... differs`. Without `aws` the sidecar and size checks are reported as NOT verified.
+- `audio stream: present` for every completed job.
+- Cold start printed as `worker start X s + model-load overhead Y s = Z s`. If a timing value is missing, null, empty or not a number the job is a FAIL ("timing metric unavailable"), never a silent pass.
+- `peak_vram_mb` per job (report-only) and `estimated spend` under the cap.
+- The worker scales to zero before the final cold job (`--- waiting for the worker to scale to zero` ends on its own).
+
+Every `aws` and `ffprobe` call has a ceiling (`SMOKE_TOOL_TIMEOUT_S`, default 30 s); a timeout is a FAIL with a message, not a hang.
+
+**Two things are still UNEXPLAINED** (first real run, seen twice): workers stayed IDLE/INITIALIZING well past the 60 s idle timeout, so the endpoint was parked by hand with max workers 0. On the next run watch the worker system logs live (console or `GET /serverless/{id}/workers`), and if it happens again on an otherwise clean run, repeat the gate with FlashBoot off (`flashboot: OFF`) to see whether it is a FlashBoot snapshot/restore effect.
+
 ### Teardown and recovery
 
 - `apply.sh teardown-endpoint --yes`: sets max workers 0, deletes the endpoint (config only); the volume and secrets stay. Re-create with `apply.sh endpoint`. The volume can only be deleted in the console, and that loses the 41 GB of models.
 - **Idle auto-scale-down:** RunPod lowers an endpoint's max workers after 3 days without requests (to 2) and sets it to 0 after 7. Jobs then fail or queue (a 409 paused endpoint). `apply.sh status` warns when max workers differs from `RUNPOD_WORKERS_MAX`; **`apply.sh endpoint` restores it**.
 - Stale pod: `apply.sh status` warns if `jubividia-models-tmp` exists; `apply.sh pod-down` terminates it.
 
-### Measured (fill in after the gate)
+### Measured (second real gate run, 2026-10-29: PASSED)
+
+Endpoint on image `sha-f9bc90a`, RTX 6000 Ada, US-WA-1, workers max 1 for the gate.
 
 | Item | Value |
 |---|---|
-| Cold start, first ever / second (worker start + model-load overhead) | _to fill_ |
-| Warm default clip `gen_time_s` (1280x704x121) | _to fill_ |
-| Cold + default clip total (user path) | _to fill_ |
-| Peak VRAM (`peak_vram_mb`) | _to fill_ |
-| Cost per clip, measured | _to fill (SPEC §7's 3-minute example assumes cold+gen about 3 min)_ |
+| Cold start, tiny clip (worker start + model-load overhead) | worker start 3.9 s + overhead 103.9 s (cold gen 117.99 s - warm gen 14.07 s) = 107.8 s. The canary's own worker start was about 58 s |
+| Warm default clip `gen_time_s` (1280x704x121 @24 fps, 5.04 s) | 68.21 s (execution 70.9 s); the second warm run 66.40 s, 2.7% from the first |
+| Cold + default clip after scale-to-zero (the user path) | delay 98.1 s + execution 193.4 s (gen 186.84 s): cold start = worker start 104.6 s + model-load overhead 118.6 s = **223.2 s** (above the 180 s flag, below the 600 s hard stop); 291.5 s from submit to done |
+| Peak VRAM (`peak_vram_mb`, report-only) | tiny 39,409 / 39,889 MiB; default clip 43,473 MiB (42.5 GiB), second warm 41,521 MiB, cold 43,761 MiB. No OOM; the 46 GiB (47,104 MiB) line was never reached |
+| Repeat of an identical request | completes in 1.02 s gen with a new output key (the per-run OUTPUT prefix fix works on the real worker); mp4 48,866 bytes, sidecar has the same prompt and seed and a different job_id |
+| Audio and outputs | every completed job's mp4 has an AAC 48 kHz stereo track; the default clip is h264 1280x704, 121 frames, 24 fps, 5.04 s video, 5.01 s audio, 917,019 bytes; mp4, jpg and json reached R2 every time |
+| Offload | not checked (not detectable from job data, and the worker logs were gone) |
+| Cost per clip (estimate at $1.75/hr) | warm default clip about $0.034 (70.9 s); first clip after idle about $0.09 to $0.14, depending on whether the worker start is billed. The runner's own estimate for the whole second run was $0.62 |
+| Scale-down | the worker took about 6 minutes after its last job (finished 15:19:14; the runner saw 0 workers and submitted the cold job at about 15:25:19) to reach zero, although the idle timeout is 60 s |
 
-#### First real gate run (2026-10-29)
+Billing read back from RunPod for the first run: the 14:00-15:00 bucket totalled $0.104 for a worker that was alive about 8 minutes, and the first worker, which never ran a job, left no billing record. That suggests idle time is not charged, but it is inferred from one bucket (the 15:00 bucket had not posted yet): treat it as an observation, not a fact, and confirm on the next billing read.
+
+#### Cold-start mitigations (proposals only; SPEC says to ask Ken before changing the idle timeout)
+
+The first clip after idle takes about 3.7 to 4.9 minutes end to end (223 s cold start plus generation), well above SPEC §7's 3-minute example. Options, cheapest first:
+1. Accept it and make the UI show a "cold starting" state with the elapsed time.
+2. A longer idle timeout so a burst of use stays warm. This looks cheap if idle time really is unbilled (see above); confirm on the billing read before asking Ken.
+3. Only if measured to help: a faster volume tier (the model load from the network volume is about 104 to 119 s of the cold start).
+Nothing here is applied; `idleTimeout` stays 60 s.
+
+#### First real gate run (2026-10-29, image before the fixes below)
 
 - The canary passed: the R2 secrets resolve on the worker, and `/status` exposes `error_code`.
 - A cold 256x256x25 t2v job on the RTX 6000 Ada completed in 125 s total (`gen_time_s` 123 s, which includes about 100+ s of model loading from the network volume; ComfyUI logged `Prompt executed in 122.33 seconds`).
 - Peak VRAM was 39,473 MiB (report-only). The mp4 has an AAC 48 kHz stereo audio stream, and the three objects reached R2.
 - Three bugs found and fixed afterwards: (1) `smoke-job.sh` reported "audio stream: MISSING" on a clip that has audio, because `ffprobe | grep -q` under `set -o pipefail` dies of SIGPIPE (the offline stubs wrote instantly, so tests missed it); (2) an identical repeated request (same prompt, seed, size) was served entirely from ComfyUI's cache (`Prompt executed in 0.01 seconds`) and failed with `[output_missing] node OUTPUT produced no mp4`; the worker now makes the OUTPUT `filename_prefix` unique per run; (3) the cold-start number was wrong because the model load sits inside `gen_time_s` (see the definition above).
 - Two observations are unexplained: workers stayed IDLE/INITIALIZING well past the 60 s idle timeout, twice. The endpoint was parked by hand with max workers 0.
+- The second run (above, on `sha-f9bc90a`) passed with all three bugs fixed. The scale-down delay (about 6 minutes after the last job) was seen again, so it is now three observations of the same behaviour; the cause is still unknown. Next steps stay as in "Interpreting a run".
 
 ### Tests
 

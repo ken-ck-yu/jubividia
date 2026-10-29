@@ -53,6 +53,8 @@ COLD_HARD_S=600
 SUM_STOP_S=700
 WARM_STOP_S=300
 VRAM_REPORT_MB=47104   # 46 GiB: report-only, never a pass/fail
+NUM_RE='^[0-9]+(\.[0-9]+)?$'
+TOOL_TIMEOUT_S=${SMOKE_TOOL_TIMEOUT_S:-30}   # ceiling for each aws / ffprobe call
 
 while (($#)); do
   case $1 in
@@ -153,7 +155,7 @@ health() { # sets H_UNHEALTHY H_THROTTLED H_IDLE H_RUNNING H_INIT
 # run_job LABEL INPUT_JSON -> J_STATUS J_ID J_DELAY J_EXEC J_GEN J_COLD J_KEY J_THUMB J_META J_VRAM J_START
 # J_ERR (error text) J_ERRCODE J_FIELDS (names of the /status fields)
 run_job() {
-  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting fails=0 hfails=0 code
+  local label=$1 input=$2 t0 st last="" now in_progress_since=-1 waiting fails=0 hfails=0 code m
   say ""
   say "--- $label: submitting"
   if health; then say "    health: idle=$H_IDLE running=$H_RUNNING initializing=$H_INIT throttled=$H_THROTTLED unhealthy=$H_UNHEALTHY"
@@ -228,13 +230,24 @@ run_job() {
   J_ERRCODE=$(json_get error_code); [[ -n $J_ERRCODE ]] || J_ERRCODE=$(json_get output.error_code)
   J_FIELDS=$(printf '%s' "$API_BODY" | "${PYTHON:-python3}" -I -c 'import json,sys; print(",".join(sorted(json.load(sys.stdin))))')
   J_START=
-  if [[ $J_STATUS == COMPLETED && -n $J_DELAY && -n $J_EXEC && -n $J_GEN ]]; then
-    J_START=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" -v g="$J_GEN" 'BEGIN{printf "%.1f",(d+e)/1000-g}')
+  # A missing, null, empty or non-numeric timing value must never read as 0 (awk would): the 180 s flag
+  # and 600 s hard stop could then pass silently. Mark the metrics unavailable; require_completed fails the job.
+  J_METRICS=1
+  J_BADMETRICS=
+  if [[ $J_STATUS == COMPLETED ]]; then
+    for m in delayTime:"$J_DELAY" executionTime:"$J_EXEC" gen_time_s:"$J_GEN"; do
+      if ! [[ ${m#*:} =~ $NUM_RE ]]; then J_METRICS=0; J_BADMETRICS+=" ${m%%:*}='${m#*:}'"; fi
+    done
+    if ((J_METRICS)); then
+      J_START=$(awkf -v d="$J_DELAY" -v e="$J_EXEC" -v g="$J_GEN" 'BEGIN{printf "%.1f",(d+e)/1000-g}')
+    else
+      say "    TIMING METRIC UNAVAILABLE:${J_BADMETRICS} (cold start and the 600 s hard stop can not be evaluated)"
+    fi
   fi
   J_AUDIO=
   say "    status=$J_STATUS delayTime=${J_DELAY:-?}ms executionTime=${J_EXEC:-?}ms gen_time_s=${J_GEN:-?} cold=${J_COLD:-?} peak_vram_mb=${J_VRAM:-null}"
   if [[ $J_STATUS == COMPLETED ]]; then
-    say "    worker start (delayTime + executionTime - gen_time; model load is inside gen_time) = ${J_START:-?} s"
+    say "    worker start (delayTime + executionTime - gen_time; model load is inside gen_time) = ${J_START:-unavailable} s"
     say "    keys: $J_KEY $J_THUMB $J_META"
     if ((R2_CHECK)); then r2_check "$label"; fi
   else
@@ -253,38 +266,103 @@ record_csv() {
     "${J_COLD:-}" "${J_DELAY:-}" "${J_EXEC:-}" "${J_GEN:-}" "${J_START:-}" "${J_VRAM:-}" "${J_KEY:-}" "${J_AUDIO:-}" >>"$CSV"
 }
 
+# aws against R2 with a ceiling on each call, so a hung tool can not hang the gate. rc 124 = timed out.
+aws_r2() {
+  AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
+    timeout "$TOOL_TIMEOUT_S" aws --endpoint-url "https://${CFG[R2_ACCOUNT_ID]}.r2.cloudflarestorage.com" "$@"
+}
+
+r2_usable() { # LABEL -> 0 when an R2 check may run (else notes why)
+  need_cfg R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET
+  if ! command -v aws >/dev/null; then NOTES+=("$1: R2 check skipped (aws CLI missing)"); say "    R2 check SKIPPED: aws CLI not installed"; return 1; fi
+  if [[ $RUNPOD_TEST_MODE == 1 && ${SMOKE_ALLOW_STUB_AWS:-0} != 1 ]]; then
+    NOTES+=("$1: R2 check skipped (test mode, no stub aws)"); say "    R2 check SKIPPED: test mode refuses a real aws/Cloudflare call"; return 1
+  fi
+  return 0
+}
+
 # r2_check LABEL: head the three objects, download the mp4, ffprobe for an audio stream.
 r2_check() {
-  need_cfg R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET
-  if ! command -v aws >/dev/null; then J_AUDIO=unchecked; NOTES+=("$1: R2 check skipped (aws CLI missing)"); say "    R2 check SKIPPED: aws CLI not installed"; return 0; fi
-  if [[ $RUNPOD_TEST_MODE == 1 && ${SMOKE_ALLOW_STUB_AWS:-0} != 1 ]]; then
-    J_AUDIO=unchecked; NOTES+=("$1: R2 check skipped (test mode, no stub aws)"); say "    R2 check SKIPPED: test mode refuses a real aws/Cloudflare call"; return 0
-  fi
-  local k tmp ctype probe ep=https://${CFG[R2_ACCOUNT_ID]}.r2.cloudflarestorage.com
+  local k tmp ctype probe rc
+  if ! r2_usable "$1"; then J_AUDIO=unchecked; return 0; fi
   tmp=$(mktemp -d)
   for k in "$J_KEY" "$J_THUMB" "$J_META"; do
-    ctype=$(AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
-      aws --endpoint-url "$ep" s3api head-object --bucket "${CFG[R2_BUCKET]}" --key "$k" --query ContentType --output text 2>/dev/null) \
-      || { FAILS+=("$1: R2 object missing: $k"); say "    R2 MISSING: $k"; continue; }
+    rc=0
+    ctype=$(aws_r2 s3api head-object --bucket "${CFG[R2_BUCKET]}" --key "$k" --query ContentType --output text 2>/dev/null) || rc=$?
+    if ((rc == 124)); then
+      FAILS+=("$1: aws head-object timed out after ${TOOL_TIMEOUT_S}s for $k"); say "    aws head-object TIMED OUT (${TOOL_TIMEOUT_S}s): $k"; J_AUDIO=unchecked; rm -rf "$tmp"; return 0
+    elif ((rc != 0)); then
+      FAILS+=("$1: R2 object missing: $k"); say "    R2 MISSING: $k"; continue
+    fi
     say "    R2 ok: $k ($ctype)"
   done
-  if AWS_ACCESS_KEY_ID=${CFG[R2_ACCESS_KEY_ID]} AWS_SECRET_ACCESS_KEY=${CFG[R2_SECRET_ACCESS_KEY]} AWS_DEFAULT_REGION=auto \
-    aws --endpoint-url "$ep" s3 cp "s3://${CFG[R2_BUCKET]}/$J_KEY" "$tmp/out.mp4" >/dev/null 2>&1; then
-    if command -v ffprobe >/dev/null; then
-      # Capture first, then match in bash. `ffprobe | grep -q` made grep exit at the first match,
-      # ffprobe got SIGPIPE (141) and pipefail turned a clip WITH audio into "MISSING".
-      probe=$(ffprobe -v error -show_entries stream=codec_type,duration -of json "$tmp/out.mp4" 2>/dev/null) || probe=
-      if [[ $probe =~ \"codec_type\":[[:space:]]*\"audio\" ]]; then
-        J_AUDIO=yes; say "    audio stream: present"
-      else
-        J_AUDIO=NO; FAILS+=("$1: no audio stream in the mp4"); say "    audio stream: MISSING"
-      fi
-    else J_AUDIO=unchecked; NOTES+=("$1: ffprobe missing, audio unchecked"); say "    audio check SKIPPED: ffprobe not installed"; fi
-  else FAILS+=("$1: could not download the mp4 from R2"); say "    R2 download failed"; fi
+  rc=0
+  aws_r2 s3 cp "s3://${CFG[R2_BUCKET]}/$J_KEY" "$tmp/out.mp4" >/dev/null 2>&1 || rc=$?
+  if ((rc == 124)); then
+    FAILS+=("$1: aws download of the mp4 timed out after ${TOOL_TIMEOUT_S}s"); say "    aws download TIMED OUT (${TOOL_TIMEOUT_S}s)"; J_AUDIO=unchecked
+  elif ((rc != 0)); then
+    FAILS+=("$1: could not download the mp4 from R2"); say "    R2 download failed"
+  elif ! command -v ffprobe >/dev/null; then
+    J_AUDIO=unchecked; NOTES+=("$1: ffprobe missing, audio unchecked"); say "    audio check SKIPPED: ffprobe not installed"
+  else
+    # Capture first, then match in bash. `ffprobe | grep -q` made grep exit at the first match,
+    # ffprobe got SIGPIPE (141) and pipefail turned a clip WITH audio into "MISSING".
+    rc=0
+    probe=$(timeout "$TOOL_TIMEOUT_S" ffprobe -v error -show_entries stream=codec_type,duration -of json "$tmp/out.mp4" 2>/dev/null) || rc=$?
+    if ((rc == 124)); then
+      J_AUDIO=unchecked; FAILS+=("$1: ffprobe timed out after ${TOOL_TIMEOUT_S}s"); say "    ffprobe TIMED OUT (${TOOL_TIMEOUT_S}s)"
+    elif [[ $probe =~ \"codec_type\":[[:space:]]*\"audio\" ]]; then
+      J_AUDIO=yes; say "    audio stream: present"
+    else
+      J_AUDIO=NO; FAILS+=("$1: no audio stream in the mp4"); say "    audio stream: MISSING"
+    fi
+  fi
   rm -rf "$tmp"
 }
 
-num_gt() { awkf -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
+# repeat_same_checks NEW_KEY NEW_META OLD_META: the repeated request must have produced a real object and a
+# sidecar that carries the same prompt and seed but a different job_id.
+repeat_same_checks() {
+  local new_key=$1 new_meta=$2 old_meta=$3 tmp rc size np ns nj op os oj
+  if ((R2_CHECK == 0)) || ! r2_usable repeat-same; then
+    NOTES+=("repeat-same: object size and sidecar comparison NOT verified (R2 check off or unavailable)")
+    return 0
+  fi
+  tmp=$(mktemp -d)
+  rc=0
+  size=$(aws_r2 s3api head-object --bucket "${CFG[R2_BUCKET]}" --key "$new_key" --query ContentLength --output text 2>/dev/null) || rc=$?
+  if ((rc == 124)); then FAILS+=("repeat-same: aws head-object timed out after ${TOOL_TIMEOUT_S}s"); rm -rf "$tmp"; return 0; fi
+  if ! [[ $size =~ ^[0-9]+$ ]] || ((size == 0)); then
+    FAILS+=("repeat-same: the new mp4 $new_key is missing or empty (content length '${size:-none}')")
+  else
+    say "    repeat-same mp4 exists: $size bytes"
+  fi
+  rc=0
+  aws_r2 s3 cp "s3://${CFG[R2_BUCKET]}/$new_meta" "$tmp/new.json" >/dev/null 2>&1 || rc=$?
+  if ((rc == 0)); then aws_r2 s3 cp "s3://${CFG[R2_BUCKET]}/$old_meta" "$tmp/old.json" >/dev/null 2>&1 || rc=$?; fi
+  if ((rc != 0)); then
+    FAILS+=("repeat-same: could not download the sidecar JSON files (rc $rc)")
+  else
+    np=$(pyj get prompt <"$tmp/new.json"); op=$(pyj get prompt <"$tmp/old.json")
+    ns=$(pyj get seed <"$tmp/new.json"); os=$(pyj get seed <"$tmp/old.json")
+    nj=$(pyj get job_id <"$tmp/new.json"); oj=$(pyj get job_id <"$tmp/old.json")
+    if [[ -z $np || $np != "$op" || -z $ns || $ns != "$os" ]]; then
+      FAILS+=("repeat-same: sidecar prompt/seed differ from the first run (prompt '$np' vs '$op', seed '$ns' vs '$os')")
+    elif [[ -z $nj || $nj == "$oj" ]]; then
+      FAILS+=("repeat-same: sidecar job_id is not different from the first run ('$nj' vs '$oj')")
+    else
+      say "    repeat-same sidecar: same prompt and seed ($ns), job_id $nj differs from $oj"
+    fi
+  fi
+  rm -rf "$tmp"
+}
+
+# strict: a non-numeric operand is never "greater" (awk would read it as 0); the job that produced it
+# is already failed by require_completed, so nothing passes silently
+num_gt() {
+  [[ $1 =~ $NUM_RE && $2 =~ $NUM_RE ]] || return 1
+  awkf -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'
+}
 
 # Cold start = worker start + model-load overhead.
 #   worker start       = delayTime + executionTime - gen_time_s   (queue + worker boot + handler overhead)
@@ -292,7 +370,16 @@ num_gt() { awkf -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
 # The model load happens INSIDE the first job (ComfyUI loads on the first /prompt), so it is part of
 # gen_time_s; subtracting gen_time_s from delay+exec alone hides it (a real run showed 2.4 s for a ~120 s load).
 cold_report() { # LABEL WORKER_START COLD_GEN WARM_GEN -> COLD_START, notes, flag > 180 s, stop > 600 s
-  local label=$1 start=$2 cgen=$3 wgen=$4 overhead
+  local label=$1 start=$2 cgen=$3 wgen=$4 overhead v
+  for v in "$start" "$cgen" "$wgen"; do
+    if ! [[ $v =~ $NUM_RE ]]; then
+      say "    $label cold start UNAVAILABLE (worker start '${start}', cold gen '${cgen}', warm gen '${wgen}'): the 180 s flag and 600 s hard stop were NOT evaluated"
+      NOTES+=("$label: cold start unavailable, metrics missing or not numeric")
+      FAILS+=("$label: cold start could not be computed (worker start '${start}', cold gen '${cgen}', warm gen '${wgen}')")
+      COLD_START=
+      return 0
+    fi
+  done
   overhead=$(awkf -v c="$cgen" -v w="$wgen" 'BEGIN{o=c-w; if (o<0) o=0; printf "%.1f", o}')
   COLD_START=$(awkf -v s="$start" -v o="$overhead" 'BEGIN{printf "%.1f", s+o}')
   say "    $label cold start = worker start ${start} s + model-load overhead ${overhead} s (cold gen ${cgen} s - warm gen ${wgen} s) = ${COLD_START} s"
@@ -307,6 +394,10 @@ check_worker_start() { # LABEL: even before the overhead is known, a worker star
 }
 
 require_completed() { # LABEL
+  if [[ $J_STATUS == COMPLETED && $J_METRICS == 0 ]]; then
+    FAILS+=("$1: timing metric unavailable (missing, null, empty or not a number:${J_BADMETRICS}); the cold-start flag and hard stop can not be evaluated")
+    summary
+  fi
   if [[ $J_STATUS != COMPLETED ]]; then
     FAILS+=("$1: job ended $J_STATUS (${J_ERR:-no error text})")
     if [[ $J_ERR == *oom* || $J_ERRCODE == oom ]]; then FAILS+=("$1: OOM"); fi
@@ -374,6 +465,7 @@ check_worker_start cold-tiny
 next_input "$TINY_T"; TINY_WARM=$NEXT_INPUT
 run_job warm-tiny "$TINY_WARM"; require_completed warm-tiny
 WARM_TINY_KEY=$J_KEY
+WARM_TINY_META=$J_META
 cold_report cold-tiny "$COLD_TINY_START" "$COLD_TINY_GEN" "$J_GEN"
 
 # 3b repeat-same: the exact same request again. ComfyUI serves everything from cache; the
@@ -384,6 +476,7 @@ if [[ $J_KEY == "$WARM_TINY_KEY" ]]; then
 else
   say "    repeat-same completed with a new output key ($J_KEY)"
 fi
+repeat_same_checks "$J_KEY" "$J_META" "$WARM_TINY_META"
 
 # 4 warm default
 next_input "$DEF_T"; DEF_WARM=$NEXT_INPUT

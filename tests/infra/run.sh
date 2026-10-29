@@ -613,15 +613,43 @@ new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set '{"load_overhead":700}'
 out=$(SM --no-r2-check 2>&1); rc=$?
 t "cold start over 600 s stops the gate" 3 "$rc"; tc "hard-stop message" "$out" "exceeds the 600s hard limit"
 
-# audio detection must not depend on how ffprobe writes (SIGPIPE under pipefail)
-mkdir -p "$T/slowstub"
-cat >"$T/slowstub/aws" <<'EOF'
+# Stub `aws` for the R2 checks. STUB_MODE: hang | emptymp4 | diffseed | samejob (default: all good).
+# head-object prints the content type, or the length when --query ContentLength is asked; `s3 cp` of a
+# .json key writes a sidecar whose job_id comes from the key; any other key gets a small file.
+write_aws_stub() {
+  cat >"$1" <<'EOF'
 #!/usr/bin/env bash
+mode=${STUB_MODE-}
+if [[ $mode == hang ]]; then exec sleep 100; fi
+key=
+for a in "$@"; do
+  case $a in s3://*) key=${a#s3://*/} ;; outputs/*) key=$a ;; esac
+done
 case " $* " in
-  *" head-object "*) echo video/mp4 ;;
-  *" cp "*) for a; do last=$a; done; echo data >"$last" ;;
+  *" head-object "*)
+    case " $* " in
+      *" ContentLength "*) if [[ $mode == emptymp4 && $key == *.mp4 ]]; then echo 0; else echo 1234; fi ;;
+      *) echo video/mp4 ;;
+    esac ;;
+  *" cp "*)
+    last=${*: -1}
+    if [[ $key == *.json ]]; then
+      jid=${key##*-}; jid=${jid%.json}
+      seed=1001; job="job-$jid"
+      if [[ $mode == diffseed ]]; then seed=$((2000 + jid)); fi
+      if [[ $mode == samejob ]]; then job=job-same; fi
+      printf '{"prompt":"a red ball","seed":%s,"job_id":"%s"}\n' "$seed" "$job" >"$last"
+    else
+      echo data >"$last"
+    fi ;;
 esac
 EOF
+  chmod +x "$1"
+}
+
+# audio detection must not depend on how ffprobe writes (SIGPIPE under pipefail)
+mkdir -p "$T/slowstub"
+write_aws_stub "$T/slowstub/aws"
 cat >"$T/slowstub/ffprobe" <<'EOF'
 #!/usr/bin/env bash
 # audio stream first, then a lot of output written slowly: a reader that quits at the first match makes this die of SIGPIPE
@@ -701,13 +729,7 @@ t "warm gen > 300 s -> stop" 3 "$rc"
 
 # R2 / ffprobe checks with stub aws + ffprobe
 mkdir -p "$T/stubs"
-cat >"$T/stubs/aws" <<'EOF'
-#!/usr/bin/env bash
-case " $* " in
-  *" head-object "*) echo video/mp4 ;;
-  *" cp "*) for a; do last=$a; done; echo data >"$last" ;;
-esac
-EOF
+write_aws_stub "$T/stubs/aws"
 cat >"$T/stubs/ffprobe" <<'EOF'
 #!/usr/bin/env bash
 if [[ ${FAKE_NO_AUDIO-} == 1 ]]; then echo '{"streams":[{"codec_type": "video"}]}'; else echo '{"streams":[{"codec_type": "video"},{"codec_type": "audio","duration":"5.0"}]}'; fi
@@ -721,6 +743,72 @@ new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
 out=$(SMOKE_ALLOW_STUB_AWS=1 FAKE_NO_AUDIO=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
 t "silent mp4 (no audio stream) fails the gate" 1 "$rc"; tc "no audio message" "$out" "no audio stream"
 for s in "${SENTINELS[@]}"; do tn "R2 gate output has no $s" "$out" "$s"; done
+
+# L-D: a missing / null / empty / text timing metric is "unavailable", never 0
+for name in delayTime executionTime gen_time_s; do
+  for mode in missing null empty text; do
+    new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"; ctl_set "{\"bad_metric\":{\"name\":\"$name\",\"mode\":\"$mode\"}}"
+    out=$(SM --no-r2-check 2>&1); rc=$?
+    t "$name $mode: gate fails (exit 1), not a silent pass" 1 "$rc"
+    tc "$name $mode: metric reported unavailable" "$out" "timing metric unavailable"
+    tn "$name $mode: no cold start line was computed" "$out" "cold start = worker start"
+    t "$name $mode: gate stopped after the first model job" 2 "$(ctl log | pj 'len([x for x in d if x["method"]=="POST" and x["path"].endswith("/run")])')"
+  done
+done
+# the same guard in cold_report / num_gt, called directly with hostile values
+cr=$(CONFIG_ENV="$T/config.env" bash -c '
+  TOOL_NAME=t; . "'"$ROOT"'/infra/runpod/lib.sh"
+  NUM_RE="^[0-9]+(\.[0-9]+)?$"; awkf() { awk "$@"; }; NOTES=(); FAILS=()
+  eval "$(sed -n "/^num_gt()/,/^}/p;/^cold_report()/,/^}/p" "'"$SMOKE"'")"
+  say() { echo "$*"; }; stop() { echo "STOPPED $1"; }
+  COLD_HARD_S=600; COLD_FLAG_S=180
+  cold_report x "" 100 5; cold_report y 10 null 5; cold_report z 10 100 text
+  if num_gt abc 5; then echo gt-true; else echo gt-false; fi
+  echo "fails=${#FAILS[@]}"' 2>&1)
+tc "cold_report with empty worker start is unavailable" "$cr" "x cold start UNAVAILABLE"
+tc "cold_report with null cold gen is unavailable" "$cr" "y cold start UNAVAILABLE"
+tc "cold_report with text warm gen is unavailable" "$cr" "z cold start UNAVAILABLE"
+tc "each unavailable cold start adds a FAIL" "$cr" "fails=3"
+tc "num_gt on text is false, not 0 < 5" "$cr" "gt-false"
+tn "no hard stop or flag from a missing value" "$cr" "STOPPED"
+
+# L-E: repeat-same must have a real new mp4 and a matching sidecar with a different job_id
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SMOKE_ALLOW_STUB_AWS=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
+t "repeat-same with real objects passes" 0 "$rc"
+tc "repeat-same reports the mp4 size" "$out" "repeat-same mp4 exists: 1234 bytes"
+tc "repeat-same sidecar checked" "$out" "repeat-same sidecar: same prompt and seed (1001)"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(STUB_MODE=emptymp4 SMOKE_ALLOW_STUB_AWS=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
+t "repeat-same with an empty mp4 fails the gate" 1 "$rc"; tc "empty mp4 message" "$out" "missing or empty (content length '0')"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(STUB_MODE=diffseed SMOKE_ALLOW_STUB_AWS=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
+t "repeat-same with a different seed in the sidecar fails" 1 "$rc"; tc "sidecar seed message" "$out" "prompt/seed differ"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(STUB_MODE=samejob SMOKE_ALLOW_STUB_AWS=1 PATH="$T/stubs:$PATH" SM 2>&1); rc=$?
+t "repeat-same with the same job_id in the sidecar fails" 1 "$rc"; tc "sidecar job_id message" "$out" "job_id is not different"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SM --no-r2-check 2>&1); tc "without R2 the extra checks are reported unverified" "$out" "NOT verified"
+
+# L-C: a hung aws or ffprobe can not hang the gate
+mkdir -p "$T/hangstub"
+write_aws_stub "$T/hangstub/aws"
+cp "$T/stubs/ffprobe" "$T/hangstub/ffprobe"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+start=$SECONDS
+out=$(STUB_MODE=hang SMOKE_TOOL_TIMEOUT_S=1 SMOKE_ALLOW_STUB_AWS=1 PATH="$T/hangstub:$PATH" SM 2>&1); rc=$?
+t "hung aws: the gate fails instead of hanging" 1 "$rc"
+tc "hung aws: clear timeout message" "$out" "aws head-object timed out after 1s"
+t "hung aws finished well inside the harness timeout" 1 "$(((SECONDS - start) < 100 ? 1 : 0))"
+cat >"$T/hangstub/ffprobe" <<'EOF'
+#!/usr/bin/env bash
+exec sleep 100
+EOF
+chmod +x "$T/hangstub/ffprobe"
+new_fake; mkcfg "RUNPOD_ENDPOINT_ID=ep-1"
+out=$(SMOKE_TOOL_TIMEOUT_S=1 SMOKE_ALLOW_STUB_AWS=1 PATH="$T/hangstub:$PATH" SM 2>&1); rc=$?
+t "hung ffprobe: the gate fails instead of hanging" 1 "$rc"
+tc "hung ffprobe: clear timeout message" "$out" "ffprobe timed out after 1s"
 
 # ---------------------------------------------------------------- 12b. nothing ever left the machine
 t "no curl in this run named a non-loopback host" 0 "$(grep -E 'https?://' "$T/argv.log" | grep -vc 'http://127.0.0.1')"
