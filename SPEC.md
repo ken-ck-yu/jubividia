@@ -7,7 +7,7 @@ Run Lightricks' open-weight **LTX-2.5** video generation model on **RunPod Serve
 Priorities, in order:
 
 1. **Scale to zero, automatically.** Zero GPU cost when idle. GPU billed only while a job runs (plus cold-start time). No manual start/stop.
-2. **Cheapest viable.** Fixed cost = network volume only (~$7/mo). Variable cost = per-second GPU while generating.
+2. **Cheapest viable.** Fixed cost = network volume only (~$5.60/mo for 80 GB). Variable cost = per-second GPU while generating.
 3. **Works from a phone.** A simple mobile-friendly page: pick mode (T2V / I2V / V2V), upload, prompt, generate, play result, browse past outputs.
 4. **Reproducible.** Worker image, endpoint config, front end and infra all live in this repo.
 
@@ -26,13 +26,15 @@ Non-goals: multi-user, public access, fine-tuning, training, interactive ComfyUI
 | Decision | Choice | Why |
 |---|---|---|
 | Platform | **RunPod Serverless** (Flex workers, min workers = 0) | True scale-to-zero, per-second billing, network-volume support |
-| GPU type | **RTX A6000 and A40 only** (both 48 GB Ampere; configure the endpoint's GPU list with exactly these two, A6000 first) | Fits FP8 transformer + Gemma 4 encoder without offloading; cheapest 48 GB cards on RunPod. Do not add L40/L40S/RTX 6000 Ada/80 GB cards without asking me — they cost more. If both A6000 and A40 availability turns out poor, report it and ask. |
-| Model variant | **LTX-2.5 22B distilled, FP8 / int8 ComfyUI build** | ~22 GB; fits 48 GB. Do NOT use full bf16 (~66 GB). Do NOT use GGUF + offload. |
-| Inference backend | **ComfyUI** + official **ComfyUI-LTXVideo** node pack, wrapped as a RunPod serverless worker (start from `runpod-workers/worker-comfyui` or equivalent current official template — verify it's maintained) | Reference implementation; one model covers T2V / I2V / V2V + audio |
-| Model storage | **RunPod Network Volume** (~100 GB) attached to the endpoint, mounted at `/runpod-volume` | Models are not baked into the image (too large, slow deploys); workers load from the volume |
+| GPU type | **Serverless RTX 6000 Ada (48 GB) at US-WA-1**, network volume at US-WA-1 (stock MEDIUM, ~$1.75/hr serverless); fallback **L40S at EU-NL-1**. | No datacenter had A6000/A40 serverless stock together with network-volume support (checked live 2026-10-29), so the original A6000/A40 choice was replaced; I approved this deviation. Fits the int8 transformer + Gemma 4 encoder without offloading. Do not add other GPUs without asking me — they cost more. |
+| Model variant | **LTX-2.5 22B distilled, int8-convrot ComfyUI build** (`ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors`, ~21.5 GB) with the int8-convrot Gemma 4 12B encoder (`gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors`, ~15.4 GB) | There is no FP8 build of LTX-2.5; int8 suits Ampere/Ada (no FP8 hardware on Ampere). Fits 48 GB. Do NOT use full bf16 (~66 GB; the bf16 encoder file is ~26 GB). Do NOT use GGUF + offload. int8 speed/quality on the RTX 6000 Ada is still to be measured (real-GPU gate pending). |
+| Inference backend | **ComfyUI** + official **ComfyUI-LTXVideo** node pack, wrapped as a RunPod serverless worker on base image `runpod/worker-comfyui:5.10.0-base`, pinned by tag and digest (5.11.0-base is a GitHub release but not on Docker Hub); ComfyUI 0.34.0, CUDA 12.8, torch 2.11 | Reference implementation; one model covers T2V / I2V / V2V + audio |
+| Model storage | **RunPod Network Volume** (80 GB, standard tier, ~$5.60/mo at $0.07/GB) attached to the endpoint, mounted at `/runpod-volume` | Models are not baked into the image (too large, slow deploys); workers load from the volume |
 | Output storage | **Cloudflare R2** bucket | Serverless workers are ephemeral; results must leave the worker. I already use R2. Worker uploads mp4 + thumbnail, returns an object key. |
 | Front end hosting | **Cloudflare Worker** (static UI + small API) behind **Cloudflare Access** (my email only) | Free tier, always on, no GPU needed to serve the page, keeps the RunPod API key server-side |
 | Auth | Cloudflare Access on the front end; RunPod endpoint called only from the Worker with the API key as a secret | Nothing public reaches RunPod directly |
+
+**Changes since first draft (2026-10-29).** GPU, model variant, base image, volume size, handler contract, model pinning and workflow details were revised after architect/reviewer/validator work. Details are in the design notes `docs/decisions/worker.md`, `docs/decisions/models.md` and `docs/decisions/workflows.md` on the feature branches of PRs #1, #2 and #3 (https://github.com/ken-ck-yu/jubividia/pulls).
 
 ## 3. Architecture
 
@@ -46,7 +48,7 @@ Cloudflare Worker  https://ltx.<mydomain>
    ├── GET  /api/status/:id → RunPod Serverless  /status/:id
    ├── GET  /api/outputs    → lists R2 objects
    ├── GET  /api/outputs/:k → streams mp4 from R2 (range requests)
-   └── PUT  /api/upload     → stores input image/video in R2, returns presigned/short-lived URL
+   └── PUT  /api/upload     → stores input image/video in R2 under inputs/, returns the object key
 
 RunPod Serverless Endpoint (min 0, max 1–2 workers, 48 GB GPU)
    worker image: ghcr.io/ken-ck-yu/ltx25-worker
@@ -55,54 +57,56 @@ RunPod Serverless Endpoint (min 0, max 1–2 workers, 48 GB GPU)
      └── /runpod-volume  ← Network Volume (models, workflow templates)
 ```
 
-Job flow: UI uploads input to R2 → Worker submits `/run` with `{mode, prompt, input_url, params}` → RunPod spins a worker (cold start if none warm) → handler runs ComfyUI workflow → uploads to R2 → UI polls `/status` → plays result from R2.
+Job flow: UI uploads input to R2 → Worker submits `/run` with `{mode, prompt, input_key, params}` → RunPod spins a worker (cold start if none warm) → handler runs ComfyUI workflow → uploads to R2 → UI polls `/status` → plays result from R2.
 
 ## 4. Components to build
 
 ### 4.1 Serverless worker image (`worker/`)
 
-- Base: current official RunPod ComfyUI worker image (or RunPod PyTorch base + ComfyUI if the worker template is stale). Pin CUDA/torch to what LTX docs require.
+- Base: `runpod/worker-comfyui:5.10.0-base`, pinned by tag and digest (ComfyUI 0.34.0, CUDA 12.8, torch 2.11).
 - Installed in image: ComfyUI, ComfyUI-LTXVideo and its requirements, `ffmpeg`, `boto3` (for R2 S3 API). **No model weights in the image.**
 - ComfyUI model paths configured (via `extra_model_paths.yaml`) to point at `/runpod-volume/models/...`.
 - `handler.py`:
-  - Input schema: `{ "mode": "t2v"|"i2v"|"v2v", "prompt": str, "negative": str?, "input_url": str? (required for i2v/v2v), "width": int?, "height": int?, "num_frames"/"duration": ?, "fps": int?, "seed": int? }`. Validate and apply defaults.
-  - Downloads `input_url` into ComfyUI's input dir if present.
-  - Loads the matching workflow template from `/runpod-volume/workflows/{mode}.json`, fills node inputs (node IDs documented in `workflows/README.md`), submits to the in-container ComfyUI, waits for completion (websocket or polling).
-  - Uploads resulting mp4 and a jpg thumbnail (ffmpeg, first frame) to R2 under `outputs/<date>/<job_id>.mp4|.jpg`.
-  - Returns `{ "key": ..., "thumb_key": ..., "duration_s": ..., "gen_time_s": ..., "seed": ... }`.
-  - Clear error messages back to the caller on failure (OOM, bad input, timeout).
+  - Input schema: `{ "mode": "t2v"|"i2v"|"v2v", "prompt": str, "negative": str?, "input_key": str? (an R2 key under `inputs/`; required for i2v/v2v), "width": int?, "height": int?, "num_frames"/"duration": ?, "fps": int?, "seed": int? }`. Validate and apply defaults. No presigned URLs.
+  - Fetches `input_key` from R2 into ComfyUI's input dir if present.
+  - Loads the matching workflow template from `/runpod-volume/workflows/{mode}.json`, fills node inputs (node IDs documented in `workflows/README.md`), submits to the in-container ComfyUI, waits for completion (websocket or polling), bounded by `JOB_TIMEOUT_S` (default 780 s, inside the 900 s platform limit).
+  - Uploads resulting mp4, a jpg thumbnail (ffmpeg, first frame) and a sidecar JSON to R2 under `outputs/<UTC date>/<YYYYMMDDTHHMMSS>-<job_id>.mp4|.jpg|.json`.
+  - Returns `{ "key": ..., "thumb_key": ..., "meta_key": ..., "v": ..., "cold": ..., "duration_s": ..., "gen_time_s": ..., "seed": ..., "width": ..., "height": ..., "num_frames": ..., "fps": ... }` (effective values for width/height/num_frames/fps/seed).
+  - Clear error messages back to the caller on failure (OOM, bad input, timeout), formatted `[code] message` with a separate `error_code` field.
 - Keep ComfyUI running between jobs within the same warm worker (the official worker does this) so warm requests skip model load.
 - Env/secrets on the endpoint: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`.
-- GitHub Actions workflow builds and pushes to GHCR on push to `main`.
+- GitHub Actions workflow builds and pushes `ghcr.io/ken-ck-yu/ltx25-worker` to GHCR on push to `main` (the package should be public; the repo is public).
 
 ### 4.2 Models (`scripts/download-models.sh`)
 
-Run once from a temporary RunPod **pod** (any cheap GPU or CPU pod) with the network volume attached, since serverless workers can't be used for a 60–80 GB download comfortably. Pull from the official Lightricks Hugging Face repo (gated — accept the LTX-2.x Community License, use `HF_TOKEN`):
+Run once from a temporary RunPod **pod** (any cheap GPU or CPU pod, created in US-WA-1) with the network volume attached, since serverless workers can't be used for a ~40 GB download comfortably. Pull from the pinned Hugging Face repo `Lightricks/LTX-2.5` at commit `49b093a39c19169a8a81721dcc541e07e945232f` (gated — accept the LTX-2.x Community License, use `HF_TOKEN`), verified against a sha256 lock `scripts/models.lock`. The repo is public, so use a plain `git clone`. Default set is 41.43 GB (5 required files + conv VAE + temporal upscaler + duration head); the optional LoRA is 8.9 GB.
 
 | Component | Volume path | Notes |
 |---|---|---|
-| LTX-2.5 22B **distilled** transformer, FP8/int8 ComfyUI build | `models/diffusion_models/` (confirm against LTXVideo README) | ~22 GB |
-| Gemma 4 12B text encoder w/ projection | `models/text_encoders/` | ~26 GB |
+| LTX-2.5 22B **distilled** transformer, int8-convrot ComfyUI build | `models/diffusion_models/` (confirm against LTXVideo README) | ~21.5 GB |
+| Gemma 4 12B text encoder w/ projection, int8-convrot | `models/text_encoders/` | ~15.4 GB |
 | Video VAE | `models/vae/` | ~1.5 GB |
 | Audio VAE | `models/vae/` | ~0.4 GB |
-| Spatial upscaler (optional) | `models/latent_upscale_models/` | |
+| Spatial upscaler (**required** for the default two-stage graph) | `models/latent_upscale_models/` | |
+| Conv VAE, temporal upscaler, duration head | per `scripts/models.lock` | part of the default set |
+| LoRA (optional) | per `scripts/models.lock` | 8.9 GB |
 
-Verify exact current filenames/folders against `docs.ltx.video` and the ComfyUI-LTXVideo README before hardcoding. Script must be idempotent. Also copy `workflows/*.json` onto the volume.
+Filenames and folders are pinned in `scripts/models.lock`. Script must be idempotent; flags: `--verify`, `--prune`, `--update-lock`, `--workflows-only`. Also copy `workflows/*.json` onto the volume.
 
 ### 4.3 Workflows (`workflows/`)
 
-Three ComfyUI **API-format** JSON workflows derived from the official LTX-2.5 examples in the node pack: `t2v.json`, `i2v.json`, `v2v.json`. Document the node IDs for prompt, negative, input file, width, height, frames/duration, fps, seed in `workflows/README.md`. Defaults: 1280×720, ~5 s, 24–25 fps, mp4 with audio. Keep defaults conservative for a 48 GB card; expose resolution/length as advanced fields.
+Three ComfyUI **API-format** JSON workflows derived from the Comfy-Org `video_ltx2_5_t2v` / `video_ltx2_5_i2v` templates (not the node-pack examples): `t2v.json`, `i2v.json`, `v2v.json`. Document the node IDs for prompt, negative, input file, width, height, frames/duration, fps, seed in `workflows/README.md`; the `SaveVideo` node is titled OUTPUT. Defaults: 1280×704 (width/height multiples of 64), 121 frames (~5 s), 24 fps, mp4 with audio; two-stage distilled graph by default, with a single-stage fallback. V2V means continuation of the input clip, not IC-LoRA editing: the guide is the last 25 frames of the input, the output is the new segment only (it overlaps ~1 s of the source, with new audio), and v2v needs >= 33 frames. Keep defaults conservative for a 48 GB card; expose resolution/length as advanced fields.
 
 ### 4.4 Serverless endpoint config (`infra/runpod/`)
 
 Prefer Terraform if a maintained RunPod provider exists; otherwise a script against the RunPod GraphQL API. Settings:
 
 - Image: `ghcr.io/ken-ck-yu/ltx25-worker:<tag>`
-- GPU types: `NVIDIA RTX A6000`, `NVIDIA A40` — exactly these two, in that priority order (verify the exact GPU ID strings RunPod's serverless API uses)
+- GPU type: RTX 6000 Ada (48 GB) at US-WA-1, fallback L40S at EU-NL-1 (verify the exact GPU ID strings RunPod's serverless API uses)
 - Workers: min **0**, max **2**
-- Idle timeout: ~60 s (ask me before going higher — this is the knob between cold starts and idle cost)
-- Execution timeout: 15 min
-- Network volume attached
+- Idle timeout: to be set after measuring cold start (ask me before going higher — this is the knob between cold starts and idle cost)
+- Execution timeout: 15 min (900 s platform limit; the handler's `JOB_TIMEOUT_S` default is 780 s)
+- Network volume (80 GB, US-WA-1) attached
 - FlashBoot: on, if available for this GPU class
 - Env vars/secrets as in 4.1
 - Document the endpoint ID in `config.env`.
@@ -162,11 +166,11 @@ Cloudflare Worker (Wrangler project):
 
 ## 7. Cost model (document in README, keep updated)
 
-- Network Volume ~100 GB: ~$7/mo.
-- Serverless A6000/A40: roughly $1.2/hr Flex (per-second; check the endpoint's live rate) — about 2× the equivalent pod rate, but billed only for cold start + generation.
+- Network Volume 80 GB (standard tier): ~$5.60/mo at $0.07/GB.
+- Serverless RTX 6000 Ada: $1.75/hr (per-second; check the endpoint's live rate), billed only for cold start + generation.
 - R2: free tier covers this volume of data.
 - Cloudflare Worker + Access: $0.
-- Example: 40 clips/month × ~3 min GPU each (incl. amortised cold starts) ≈ 2 GPU-hours ≈ $2.5 + $7 storage ≈ **~$10/month**.
+- Example: 40 clips/month × ~3 min GPU each (incl. amortised cold starts) ≈ 2 GPU-hours × $1.75 ≈ $3.50 + $5.60 storage ≈ **~$9/month**.
 
 ## 8. References
 
@@ -178,7 +182,14 @@ Cloudflare Worker (Wrangler project):
 
 ## 9. Open questions for me (ask before assuming)
 
-- Which domain for the front end hostname.
-- Which RunPod datacenter for the network volume (needs A6000/A40 serverless availability; prefer EU).
-- Idle timeout value once we've measured cold start.
-- Whether to keep inputs in R2 long-term or delete after the job.
+Answered:
+
+- Front end hostname: `<name>.workers.dev` for now; a custom domain can be added later.
+- Network volume datacenter: US-WA-1 (see section 2).
+- Inputs in R2: kept for 7 days via a lifecycle rule.
+- R2 bucket: `jubividia-ltx-eu` (WEUR) in my account.
+
+Still open:
+
+- Idle timeout value, once we've measured cold start.
+- Real-GPU gate: int8-convrot on the RTX 6000 Ada (cold/warm times, peak VRAM) is still pending.
