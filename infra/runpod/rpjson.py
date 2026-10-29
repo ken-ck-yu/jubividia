@@ -138,12 +138,14 @@ def diff_endpoint(actual, desired):
         out.append("dataCenterIds")
     if volume_ids(actual) != sorted(m["volumeId"] for m in desired["mounts"]["network"]):
         out.append("mounts")
-    aw, dw = actual.get("workers") or {}, desired["workers"]
-    if any(aw.get(k) != dw[k] for k in dw):
-        out.append("workers")
+    # scaling is listed (and so patched) before workers: idleTimeout is rejected while the
+    # endpoint still scales on REQUEST_COUNT.
     asc, dsc = actual.get("scaling") or {}, desired["scaling"]
     if any(asc.get(k) != dsc[k] for k in dsc):
         out.append("scaling")
+    aw, dw = actual.get("workers") or {}, desired["workers"]
+    if any(aw.get(k) != dw[k] for k in dw):
+        out.append("workers")
     if actual.get("flashboot") != desired["flashboot"]:
         out.append("flashboot")
     if actual.get("timeout") != desired["timeout"]:
@@ -166,14 +168,18 @@ def main():
     elif op == "ids":
         pairs = [a.split("=", 1) for a in sys.argv[2:]]
         try:
-            items = listify(json.load(sys.stdin))
+            raw = json.load(sys.stdin)
+            items = listify(raw)
         except ValueError:
-            items = []
+            raw, items = None, []
+        if isinstance(raw, dict) and (raw.get("pagination") or {}).get("hasNextPage"):
+            sys.exit("rpjson: list has more than one page; refusing to guess")
         for it in items:
             if isinstance(it, dict) and it.get("id") and all(str(dig(it, k)) == v for k, v in pairs):
                 print(it["id"])
     elif op == "body-volume":
-        emit({"name": env("V_NAME"), "size": int(env("V_GB")), "dataCenterId": env("V_DC")})
+        emit({"name": env("V_NAME"), "size": int(env("V_GB")), "dataCenter": env("V_DC"),
+              "type": "STANDARD"})
     elif op == "body-volume-size":
         emit({"size": int(env("V_GB"))})
     elif op == "body-secret":
@@ -201,7 +207,8 @@ def main():
             "dataCenterIds": [env("POD_DC")],
             "mounts": {"network": [{"volumeId": env("POD_VOLUME_ID"), "path": "/runpod-volume"}]},
             "disk": int(env("POD_DISK", "20")), "ports": [], "env": e,
-            "cmd": ["bash", "-c", POD_SCRIPT],
+            # entrypoint + cmd (exec form) so the image's own ENTRYPOINT cannot swallow the script
+            "entrypoint": ["bash", "-c"], "cmd": [POD_SCRIPT],
         })
     else:
         sys.exit(__doc__)

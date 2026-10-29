@@ -25,11 +25,23 @@ ROOT=$(cd "$LIB_DIR/../.." && pwd)
 CONFIG_ENV=${CONFIG_ENV:-$ROOT/config.env}
 DRY_RUN=${DRY_RUN:-0}
 
-# Base URL of the RunPod management REST API (unverified default, see README; override
-# with RUNPOD_API_BASE, the offline tests point it at 127.0.0.1).
-API_BASE=${RUNPOD_API_BASE:-https://rest.runpod.io/v1}
-# Serverless runtime base (/<endpoint>/run, /status, /health); used by smoke-job.sh.
+# Base URL of the RunPod management REST API: server https://api.runpod.io, all routes
+# under /v2 (RunPod's public v2 OpenAPI document). Override with RUNPOD_API_BASE.
+API_BASE=${RUNPOD_API_BASE:-https://api.runpod.io/v2}
+# Serverless runtime base (/<endpoint>/run, /status/<job>, /health); used by smoke-job.sh.
 RUN_BASE=${RUNPOD_RUN_BASE:-https://api.runpod.ai/v2}
+# Test mode (set by tests/infra/run.sh): every URL this code requests must be on 127.0.0.1,
+# so a test can never reach a real host. Checked again right before each curl.
+RUNPOD_TEST_MODE=${RUNPOD_TEST_MODE:-0}
+assert_url_allowed() {
+  if [[ $RUNPOD_TEST_MODE == 1 && $1 != http://127.0.0.1:* ]]; then
+    printf '%s: TEST MODE refuses non-loopback URL %s\n' "${TOOL_NAME:-apply}" "${1%%\?*}" >&2
+    exit 4
+  fi
+}
+assert_url_allowed "$API_BASE"
+assert_url_allowed "$RUN_BASE"
+assert_url_allowed "${GHCR_BASE:-http://127.0.0.1:9}"
 
 # Names fixed by the design note (secret names are immutable on RunPod).
 SECRET_R2_KEY_ID=ltx_r2_access_key_id
@@ -138,11 +150,12 @@ API_BODY=
 http() {
   local method=$1 url=$2 body=${3-} out
   [[ -n ${CFG[RUNPOD_API_KEY]-} ]] || die "RUNPOD_API_KEY is not set in $CONFIG_ENV"
+  assert_url_allowed "$url"
   if [[ -n $body ]]; then
-    out=$(printf '%s' "$body" | curl -sS --max-time 60 -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
+    out=$(printf '%s' "$body" | curl -sS --max-time "${HTTP_MAX_TIME:-60}" -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
       -H 'Content-Type: application/json' --data-binary @- -w '\n%{http_code}' "$url" 2>/dev/null) || true
   else
-    out=$(curl -sS --max-time 60 -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
+    out=$(curl -sS --max-time "${HTTP_MAX_TIME:-60}" -X "$method" -K <(printf 'header = "Authorization: Bearer %s"\n' "${CFG[RUNPOD_API_KEY]}") \
       -w '\n%{http_code}' "$url" </dev/null 2>/dev/null) || true
   fi
   API_STATUS=${out##*$'\n'}
@@ -176,8 +189,8 @@ api_delete() { # api_delete pod|endpoint|secret_hf ID
   [[ $id =~ ^[A-Za-z0-9_-]+$ ]] || die "internal error: bad id for delete"
   case $kind in
     pod) path=/pods/$id ;;
-    endpoint) path=/endpoints/$id ;;
-    secret_hf) path=/secrets/$id ;;
+    endpoint) path=/serverless/$id ;;
+    secret_hf) path=/account/secrets/$id ;;
     *) die "internal error: delete of '$kind' is not supported by design" ;;
   esac
   api DELETE "$path"

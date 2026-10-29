@@ -83,6 +83,7 @@ ghcr_check() {
   if [[ $repo != ghcr.io/* ]]; then say "skip GHCR check: image is not on ghcr.io"; return 0; fi
   repo=${repo#ghcr.io/}
   base=${GHCR_BASE:-https://ghcr.io}
+  assert_url_allowed "$base"
   token=$(curl -sS --max-time 30 "$base/token?service=ghcr.io&scope=repository:$repo:pull" 2>/dev/null | pyj get token) || true
   [[ -n $token ]] || die "GHCR: could not get an anonymous pull token for $repo (is the package public?)"
   code=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -I \
@@ -99,17 +100,17 @@ cmd_preflight() {
   img=$(image_ref)
   say "ok   image ref: $img"
   if valid_git_ref "$(cfg GIT_REF)"; then say "ok   GIT_REF is a full commit sha"; else warn "GIT_REF is not a 40-hex commit sha (needed by pod-up)"; fi
-  api GET /endpoints
-  api_must "API key / base URL check (GET /endpoints at $API_BASE)"
+  api GET /serverless
+  api_must "API key / base URL check (GET /serverless at $API_BASE)"
   say "ok   RunPod API reachable, key accepted"
   ((SKIP_GHCR)) || ghcr_check
-  n=$(find_ids /network-volumes "name=$(cfg RUNPOD_VOLUME_NAME jubividia-ltx-us-wa1)" "dataCenterId=$(cfg RUNPOD_DC US-WA-1)" | grep -c .) || true
+  n=$(find_ids /network-volumes "name=$(cfg RUNPOD_VOLUME_NAME jubividia-ltx-us-wa1)" "dataCenter=$(cfg RUNPOD_DC US-WA-1)" "type=STANDARD" | grep -c .) || true
   say "info volumes with the exact name+DC: $n (0 = volume will be created, 1 = adopted, >1 = stop)"
-  n=$(find_ids /endpoints "name=$(cfg RUNPOD_ENDPOINT_NAME jubividia-ltx25)" | grep -c .) || true
+  n=$(find_ids /serverless "name=$(cfg RUNPOD_ENDPOINT_NAME jubividia-ltx25)" | grep -c .) || true
   say "info endpoints with the exact name: $n"
-  n=$(find_ids /secrets "name=$SECRET_R2_KEY_ID" | grep -c .) || true
+  n=$(find_ids /account/secrets "name=$SECRET_R2_KEY_ID" | grep -c .) || true
   say "info secret $SECRET_R2_KEY_ID: $n"
-  n=$(find_ids /secrets "name=$SECRET_R2_KEY_SECRET" | grep -c .) || true
+  n=$(find_ids /account/secrets "name=$SECRET_R2_KEY_SECRET" | grep -c .) || true
   say "info secret $SECRET_R2_KEY_SECRET: $n"
   say "TODO (not checkable here): confirm payment method and balance (~\$15) in the console; re-read RTX 6000 Ada stock at the DC and CPU stock right before each billable step."
 }
@@ -128,7 +129,7 @@ cmd_volume() {
     ((API_STATUS != 404)) || die "RUNPOD_NETWORK_VOLUME_ID=$id does not exist on this account; clear it in config.env if you really want a new volume"
     api_must "GET /network-volumes/$id"
   else
-    ids=$(find_ids /network-volumes "name=$name" "dataCenterId=$dc")
+    ids=$(find_ids /network-volumes "name=$name" "dataCenter=$dc" "type=STANDARD")
     n=$(printf '%s\n' "$ids" | grep -c .) || true
     if ((n > 1)); then die "$n volumes named '$name' in $dc; refusing to guess. Set RUNPOD_NETWORK_VOLUME_ID to the right one."; fi
     if ((n == 1)); then
@@ -159,20 +160,20 @@ cmd_volume() {
       api_must "grow volume"
     fi
   fi
-  say "ok   volume $id ($(json_get name), $(json_get dataCenterId))"
+  say "ok   volume $id ($(json_get name), $(json_get dataCenter))"
 }
 
 # ---------------------------------------------------------------- secrets
 # ensure_secret NAME VALUE ID_KEY   (create if absent; rotate only with --rotate)
 ensure_secret() {
   local name=$1 value=$2 idkey=$3 ids n id body
-  ids=$(find_ids /secrets "name=$name")
+  ids=$(find_ids /account/secrets "name=$name")
   n=$(printf '%s\n' "$ids" | grep -c .) || true
   ((n <= 1)) || die "$n secrets named $name; refusing to guess"
   if ((n == 0)); then
     say "creating secret $name (free)"
     body=$(S_NAME=$name S_VALUE=$value pyj body-secret)
-    api POST /secrets "$body"
+    api POST /account/secrets "$body"
     api_must "create secret $name"
     id=$(json_get id)
     maybe_die_after_create "secret:$name"
@@ -183,7 +184,7 @@ ensure_secret() {
     if ((ROTATE)); then
       say "rotating secret $name (workers read the new value at their next boot)"
       body=$(S_VALUE=$value pyj body-secret-value)
-      api PATCH "/secrets/$id" "$body"
+      api PATCH "/account/secrets/$id" "$body"
       api_must "rotate secret $name"
     else
       say "ok   secret $name exists (use --rotate to change its value)"
@@ -202,7 +203,7 @@ cmd_secrets() {
 verify_endpoint() { # verify_endpoint ID DESIRED -> patches only differing groups, then re-reads
   local id=$1 desired=$2 groups g pass
   for pass in 1 2; do
-    api GET "/endpoints/$id"
+    api GET "/serverless/$id"
     api_must "read back endpoint $id"
     groups=$(printf '%s' "$API_BODY" | EP_DESIRED=$desired pyj diff-endpoint)
     if [[ -z $groups ]]; then
@@ -219,7 +220,7 @@ verify_endpoint() { # verify_endpoint ID DESIRED -> patches only differing group
         image | env) say "     (an image/env change creates a new release and replaces workers)" ;;
         gpu) say "     (pools and excludedTypes are always sent together)" ;;
       esac
-      api PATCH "/endpoints/$id" "$(EP_DESIRED=$desired pyj group-body "$g")" show
+      api PATCH "/serverless/$id" "$(EP_DESIRED=$desired pyj group-body "$g")" show
       api_must "patch endpoint field $g"
     done
     ((DRY_RUN)) && return 0
@@ -235,11 +236,11 @@ cmd_endpoint() {
   say "workers: min $(cfg RUNPOD_WORKERS_MIN 0) max ${MAX_WORKERS_FLAG:-$(cfg RUNPOD_WORKERS_MAX 2)}, idleTimeout $(cfg RUNPOD_IDLE_TIMEOUT_S 60) s, flashboot FLASHBOOT, timeout $(cfg RUNPOD_EXEC_TIMEOUT_MS 900000) ms"
   id=$(cfg RUNPOD_ENDPOINT_ID)
   if [[ -n $id ]]; then
-    api GET "/endpoints/$id"
+    api GET "/serverless/$id"
     ((API_STATUS != 404)) || die "RUNPOD_ENDPOINT_ID=$id does not exist; clear it in config.env if you want it re-created"
-    api_must "GET /endpoints/$id"
+    api_must "GET /serverless/$id"
   else
-    ids=$(find_ids /endpoints "name=$name")
+    ids=$(find_ids /serverless "name=$name")
     n=$(printf '%s\n' "$ids" | grep -c .) || true
     ((n <= 1)) || die "$n endpoints named '$name'; refusing to guess. Set RUNPOD_ENDPOINT_ID."
     if ((n == 1)); then
@@ -248,7 +249,7 @@ cmd_endpoint() {
       write_id RUNPOD_ENDPOINT_ID "$id"
     else
       say "creating endpoint '$name' (idle cost \$0; a running RTX 6000 Ada worker bills \$1.75/hr)"
-      api POST /endpoints "$desired" show
+      api POST /serverless "$desired" show
       api_must "create endpoint"
       id=$(json_get id)
       [[ -n $id ]] || die "endpoint create returned no id"
@@ -306,19 +307,19 @@ EOF
 
 ensure_hf_secret() {
   local ids n id body
-  ids=$(find_ids /secrets "name=$SECRET_HF")
+  ids=$(find_ids /account/secrets "name=$SECRET_HF")
   n=$(printf '%s\n' "$ids" | grep -c .) || true
   ((n <= 1)) || die "$n secrets named $SECRET_HF"
   if ((n == 0)); then
     say "creating temporary secret $SECRET_HF (deleted again by pod-down)"
     body=$(S_NAME=$SECRET_HF S_VALUE=${CFG[HF_TOKEN]} pyj body-secret)
-    api POST /secrets "$body"
+    api POST /account/secrets "$body"
     api_must "create secret $SECRET_HF"
   else
     id=$ids
     say "updating temporary secret $SECRET_HF"
     body=$(S_VALUE=${CFG[HF_TOKEN]} pyj body-secret-value)
-    api PATCH "/secrets/$id" "$body"
+    api PATCH "/account/secrets/$id" "$body"
     api_must "update secret $SECRET_HF"
   fi
 }
@@ -340,9 +341,10 @@ cmd_pod_logs() {
   local id
   id=$(resolve_pod)
   [[ -n $id ]] || die "no pod named $POD_NAME"
-  api GET "/pods/$id/logs"
+  # The route is a server-sent-event stream; read the last lines for a few seconds and stop.
+  HTTP_MAX_TIME=15 api GET "/pods/$id/logs?tail=300"
   if api_ok; then say "$API_BODY"; else
-    die "pod logs are not available over this REST route (HTTP $API_STATUS). Use the console or the MCP stream-pod-logs tool for pod $id."
+    die "pod logs failed: HTTP $API_STATUS ${API_BODY:0:300}. The console or the MCP stream-pod-logs tool also work for pod $id."
   fi
 }
 
@@ -358,14 +360,14 @@ cmd_pod_down() {
     api_must "terminate pod $id"
     if ((!DRY_RUN)); then
       api GET "/pods/$id"
-      ((API_STATUS == 404)) || [[ $(json_get desiredStatus) == TERMINATED ]] || die "pod $id still exists after delete; check the console NOW (it bills)"
+      ((API_STATUS == 404)) || [[ $(json_get status) == TERMINATED ]] || die "pod $id still exists after delete; check the console NOW (it bills)"
       say "ok   pod $id is gone (read back)"
     fi
   fi
   write_id RUNPOD_POD_ID ""
   # Deliberate, documented exception to "never auto-delete secrets": the temporary
   # HF token secret, by its exact name, nothing else.
-  sid=$(find_ids /secrets "name=$SECRET_HF")
+  sid=$(find_ids /account/secrets "name=$SECRET_HF")
   if [[ -n $sid ]]; then
     [[ $(printf '%s\n' "$sid" | grep -c .) == 1 ]] || die "more than one secret named $SECRET_HF; not deleting any"
     api_delete secret_hf "$sid"
@@ -382,16 +384,16 @@ cmd_status() {
   id=$(cfg RUNPOD_NETWORK_VOLUME_ID)
   if [[ -n $id ]]; then
     api GET "/network-volumes/$id"
-    if api_ok; then say "   $id name=$(json_get name) size=$(json_get size)GB dc=$(json_get dataCenterId)  (\$0.07/GB/month)"; else say "   $id: HTTP $API_STATUS"; fi
+    if api_ok; then say "   $id name=$(json_get name) size=$(json_get size)GB dc=$(json_get dataCenter)  (\$0.07/GB/month)"; else say "   $id: HTTP $API_STATUS"; fi
   else say "   none recorded"; fi
   say "== secrets"
   for k in "$SECRET_R2_KEY_ID" "$SECRET_R2_KEY_SECRET"; do
-    say "   $k: $(find_ids /secrets "name=$k" | grep -c . || true) found"
+    say "   $k: $(find_ids /account/secrets "name=$k" | grep -c . || true) found"
   done
   say "== endpoint"
   id=$(cfg RUNPOD_ENDPOINT_ID)
   if [[ -n $id ]]; then
-    api GET "/endpoints/$id"
+    api GET "/serverless/$id"
     if api_ok; then
       say "   $id name=$(json_get name) image=$(json_get image)"
       say "   workers min=$(json_get workers.min) max=$(json_get workers.max) idleTimeout=$(json_get workers.idleTimeout) flashboot=$(json_get flashboot) timeout=$(json_get timeout)ms (\$1.75/hr per running worker)"
@@ -415,12 +417,12 @@ cmd_teardown_endpoint() {
   id=$(cfg RUNPOD_ENDPOINT_ID)
   [[ -n $id ]] || die "RUNPOD_ENDPOINT_ID is not set"
   say "setting workers.max=0 on $id, then deleting the endpoint (config only; the volume and secrets stay)"
-  api PATCH "/endpoints/$id" "{\"workers\":{\"min\":0,\"max\":0,\"idleTimeout\":$(cfg RUNPOD_IDLE_TIMEOUT_S 60)}}"
+  api PATCH "/serverless/$id" "{\"workers\":{\"min\":0,\"max\":0,\"idleTimeout\":$(cfg RUNPOD_IDLE_TIMEOUT_S 60)}}"
   api_must "set workers.max=0"
   api_delete endpoint "$id"
   api_must "delete endpoint $id"
   if ((!DRY_RUN)); then
-    api GET "/endpoints/$id"
+    api GET "/serverless/$id"
     ((API_STATUS == 404)) || die "endpoint $id still readable after delete"
   fi
   write_id RUNPOD_ENDPOINT_ID ""
