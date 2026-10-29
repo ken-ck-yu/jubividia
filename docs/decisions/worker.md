@@ -155,3 +155,12 @@ Architect Q1–Q8 accepted as recommended; Q9 and the input mechanism decided as
 8. If int8-convrot fails on the target GPU: stop and ask Ken about a different GPU. Do not fall back to bf16 or GGUF.
 9. **GPU / datacenter changed from SPEC §2** (no datacenter has A6000/A40 serverless stock *and* network-volume support): serverless **RTX 6000 Ada at US-WA-1** (stock MEDIUM, $1.75/hr serverless), network volume at US-WA-1. Fallback if stock disappoints: L40S at EU-NL-1. The gating "real generation" test therefore runs on the RTX 6000 Ada, not on A6000/A40. Ken approved this deviation from SPEC §2.
 10. **Input contract changed:** the handler takes `input_key` (an R2 key under `inputs/`), not `input_url`. The handler downloads it with its own R2 credentials and rejects any key outside `inputs/`. No presigned URLs, no arbitrary URL fetching (SSRF concern moot). Download the input before loading models.
+
+### Later decisions (2026-10-29, after validation)
+
+- Base image is **`runpod/worker-comfyui:5.10.0-base`**, pinned by tag and digest. `5.11.0-base` is a GitHub release but is not on Docker Hub. Ken accepted 5.10.0.
+- Default clip is **1280x704** (720 is not a multiple of 32), 24 fps, 121 frames. Ken accepted. The `workflows` design note requires width and height to be multiples of **64** (two-stage graph); that handler change, plus the v2v INPUT field `file`, lands with the `workflows` feature.
+- `JOB_TIMEOUT_S` default is **780 s** (was 840) so uploads and orphan cleanup always finish inside the 900 s platform limit (hard deadline 885 s). Coordinator-accepted, two-way.
+- Error text is `[code] message` with `error_code` also kept as a field, in case RunPod `/status` hides the structured field. No job-level retry beyond the bounded upload retry: fail and resubmit.
+- The repo is **public** and the GHCR package is expected to be public. Verify package visibility after the first CI run.
+- Still unverified until the `endpoint` feature (see `docs/validation/worker.md`): real generation and int8-convrot speed/VRAM on the RTX 6000 Ada (Ken's decision-8 gate; pass/fail thresholds not yet set), real R2 upload, whether `/status` exposes `error_code`, and the first CI run on the 24.75 GB image.
