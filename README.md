@@ -8,6 +8,12 @@ Self-hosted [LTX-2.5](https://docs.ltx.video) video generation (text / image / v
 
 Setup, usage, measured timings and cost will be filled in as features land.
 
+## Documentation
+
+- [`docs/setup-from-scratch.md`](docs/setup-from-scratch.md): the one working path to rebuild the whole system on empty accounts, with exact commands, dashboard clicks, expected results, costs and the pitfalls we hit.
+- [`docs/configuration.md`](docs/configuration.md): reference for every `config.env` key, the Worker secrets and variables, endpoint settings, bucket and volume layout, the handler contract, credential scopes, spend limits and the cost table.
+- [`docs/architecture.md`](docs/architecture.md): the architecture with diagrams, why each part was chosen, the measured numbers, known limitations and the operations runbook (park and unpark, rotate keys, deploy an image, add or remove a user, teardown).
+
 ## Models (network volume)
 
 The weights live on a RunPod network volume, never in the image. `scripts/download-models.sh` fills it from the gated Hugging Face repo `Lightricks/LTX-2.5`, pinned to commit `49b093a39c19169a8a81721dcc541e07e945232f` (2026-10-11), and `scripts/models.lock` records the exact files, sizes and sha256.
