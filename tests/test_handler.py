@@ -614,3 +614,37 @@ def test_peak_vram_null_without_nvidia_smi(env, monkeypatch):
 
 def test_platform_limit_default_is_900():
     assert handler.PLATFORM_LIMIT_S == 900
+
+
+def test_exec_timeout_env_overrides_platform_limit():
+    import subprocess
+    code = ("import os, sys; os.environ['EXEC_TIMEOUT_S'] = '1200'; "
+            "sys.path.insert(0, os.path.join(%r, '..', 'worker')); import handler; "
+            "print(handler.PLATFORM_LIMIT_S)" % os.path.dirname(__file__))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    assert r.stdout.strip() == "1200", r.stderr
+
+
+@pytest.mark.parametrize("raw,expected", [("0", 0.2), ("-3", 0.2), ("0.05", 0.2), ("0.5", 0.5), ("2", 2.0)])
+def test_vram_sample_interval_is_clamped(raw, expected):
+    assert handler.clamp_sample_interval(raw) == expected
+
+
+def test_sampler_is_stopped_when_generation_fails(env, monkeypatch):
+    monkeypatch.setattr(handler, "read_vram_mb", lambda: 5)
+    created = []
+
+    class Spy(handler.VramSampler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            created.append(self)
+
+    def boom(*a, **k):
+        raise handler.JobError("timeout", "generation exceeded")
+
+    monkeypatch.setattr(handler, "VramSampler", Spy)
+    monkeypatch.setattr(handler, "wait_for_result", boom)
+    out = handler.handler({"id": "j", "input": v()})
+    assert out["error_code"] == "timeout"
+    assert len(created) == 1
+    assert created[0]._stop.is_set() and not created[0]._t.is_alive()

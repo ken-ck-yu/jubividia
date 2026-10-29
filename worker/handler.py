@@ -67,7 +67,14 @@ JOB_TIMEOUT_S = int(os.environ.get("JOB_TIMEOUT_S", "780"))
 # (= that value / 1000) to the worker so the two cannot drift apart. The default must
 # equal RUNPOD_EXEC_TIMEOUT_MS / 1000 in config.env.example.
 PLATFORM_LIMIT_S = int(os.environ.get("EXEC_TIMEOUT_S", "900"))
-VRAM_SAMPLE_S = float(os.environ.get("VRAM_SAMPLE_S", "1.0"))
+VRAM_SAMPLE_MIN_S = 0.2  # a smaller interval would fork nvidia-smi in a tight loop
+
+
+def clamp_sample_interval(v):
+    return max(VRAM_SAMPLE_MIN_S, float(v))
+
+
+VRAM_SAMPLE_S = clamp_sample_interval(os.environ.get("VRAM_SAMPLE_S", "1.0"))
 SAFETY_S = 15  # everything (incl. uploads/cleanup) must finish this early
 ATTEMPT_MAX_S = 45  # hard cap for one upload attempt, enforced by a thread join
 COMFY_READY_TIMEOUT_S = int(os.environ.get("COMFY_READY_TIMEOUT_S", "300"))
@@ -303,7 +310,7 @@ def upload_retry(fn, hard_deadline):
     for attempt in range(UPLOAD_TRIES):
         remaining = hard_deadline - time.time()  # checked before EACH try
         if remaining < 1:
-            last = last or "no time left before the platform limit"
+            last = last or "no time left before the execution timeout"
             break
         try:
             return run_bounded(fn, min(remaining, ATTEMPT_MAX_S))
