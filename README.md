@@ -38,7 +38,7 @@ Default set: five required files plus the conv VAE, temporal upscaler and durati
    time scripts/download-models.sh
    time scripts/download-models.sh --verify    # required: full re-hash of all 41 GB
    ```
-   Before the download starts the script prints `df -hT` for the volume: check that the size is about 80 GB and the filesystem is the network volume's, not the pod's local disk. The script finds the volume at `/runpod-volume` or `/workspace` (or use `--volume-root DIR` / env `VOLUME_ROOT`), refuses to run if that path is not a mount point (so it can never fill container disk), checks free space, downloads two files at a time into `*.partial`, verifies size and sha256, then renames atomically. Expect roughly 3-7 minutes for 41 GB plus a few minutes of hashing (unmeasured). A second run downloads nothing. Only one run per volume at a time (a lock file on the volume); a second run exits with a message. Normal runs trust file size for files already present, so the full `--verify` after the first download is what confirms every byte.
+   Before the download starts the script prints `df -hT` for the volume: check that the size is about 80 GB and the filesystem is the network volume's, not the pod's local disk. The script finds the volume at `/runpod-volume` or `/workspace` (or use `--volume-root DIR` / env `VOLUME_ROOT`), refuses to run if that path is not a mount point (so it can never fill container disk), checks free space, downloads two files at a time into `*.partial`, verifies size and sha256, then renames atomically. Expect roughly 3-7 minutes for 41 GB plus a few minutes of hashing (unmeasured). A second run downloads nothing. Only one run per volume at a time (a `flock` lock file on the volume); a second run exits with a message. If the volume filesystem does not support `flock`, the script says so (not "another run") and you can re-run with `--no-lock` (or `NO_LOCK=1`). **Warning:** `--no-lock` removes the protection against two runs corrupting each other's `.partial` files; use it only for a supervised single run with no other pod attached. The script needs bash 5.0+ (Ubuntu 22.04 pod images have 5.1) and fails early on older bash. Normal runs trust file size for files already present, so the full `--verify` after the first download is what confirms every byte.
 5. **Record the first real run** in "Measured" below, then **terminate** the pod (do not just stop it; a stopped pod keeps billing disk), and **rotate/revoke the HF token**.
 
 If the mount-point check wrongly fails on a pod (a bind mount, say), confirm with `df` that the path really is the volume, then re-run with `SKIP_MOUNT_CHECK=1`.
@@ -66,6 +66,7 @@ It records the commit and its date in the lock header and leaves the lock untouc
 | `--update-lock [--rev C]` | Refresh sizes and sha256 in the lock from the HF API. |
 | `--workflows-only` | Copy only `workflows/*.json` to `<volume>/workflows/` (validated as JSON first). |
 | `--with-lora` | Include the optional LoRA. |
+| `--no-lock` | Skip the run lock (see the warning in setup step 4). |
 | `--list` | Print the lock as tab-separated rows. |
 
 401 means the token is invalid; 403 means the license has not been accepted by the account that owns the token (the message names the model page).
