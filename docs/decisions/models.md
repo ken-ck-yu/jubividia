@@ -1,7 +1,7 @@
 # models — design note
 
 ## Summary
-`scripts/download-models.sh` is run once (and again only when the manifest changes) from a throwaway RunPod CPU pod in US-WA-1 with the network volume attached. It reads a committed, revision-pinned manifest (`scripts/models.lock`: path, size, sha256 per file), downloads each file from the gated `Lightricks/LTX-2.5` repo with `curl -C -` into `*.partial`, verifies size and sha256, then atomically renames. It then copies `workflows/*.json` into `<volume>/workflows/`. Re-running is a no-op for files already present at the right size. The default set is 41.43 GB (38.6 GiB); the volume should be 60 GB, not 100 GB.
+`scripts/download-models.sh` is run once (and again only when the manifest changes) from a throwaway RunPod CPU pod in US-WA-1 with the network volume attached. It reads a committed, revision-pinned manifest (`scripts/models.lock`: path, size, sha256 per file), downloads each file from the gated `Lightricks/LTX-2.5` repo with `curl -C -` into `*.partial`, verifies size and sha256, then atomically renames. It then copies `workflows/*.json` into `<volume>/workflows/`. Re-running is a no-op for files already present at the right size. The default set is 41.43 GB (38.6 GiB); the volume is **80 GB** (Ken's decision; the architect's original 60 GB is superseded, see "Ken's decisions" below), not the SPEC's 100 GB.
 
 ## Verified facts (searched 2026-10-29)
 Source: HF API `Lightricks/LTX-2.5` (repo commit `49b093a39c19169a8a81721dcc541e07e945232f`, last modified 2026-10-11), `gated: auto`, license `ltx-2.x-community-license-agreement`, plus the model card. The repo's folder names are already the ComfyUI folder names, so the HF path and the volume path are identical (`models/<repo path>`). docs.ltx.video returned 403 to the fetcher, so docs.ltx.video itself was NOT read; the HF model card and repo tree were used instead. The HF card does not say where files go in ComfyUI, but the repo layout matches the folders in worker.md.
@@ -56,7 +56,7 @@ Pod recipe (documented in README, done by Ken or the `endpoint` feature): cheape
 
 ## Decisions
 ### One-way doors
-1. **Network volume size = 60 GB (SPEC says ~100 GB).** Options: (a) 50 GB: fits the 38.6 GiB default set plus about 8 GB. (b) 60 GB: also fits the extra dev-transformer int8 (21.5 GB) experiment? No: 41.4 + 21.5 = 62.9 GB, so 60 does not; it gives about 18 GB headroom for ComfyUI caches, a second VAE or the 8.9 GB LoRA. (c) 100 GB as in SPEC: $7/mo, 2.4x the data. Recommend (b) 60 GB = $4.20/mo. Why: volumes can grow but never shrink, so start small; growing later is cheap and non-destructive. Reversibility: growing is free; shrinking means create new volume, recopy ~41 GB, re-point the endpoint (small money, real hassle). Note SPEC §7's "~$7/mo" becomes ~$4.20.
+1. **Network volume size = 60 GB (SPEC says ~100 GB).** _Superseded: Ken decided 80 GB ($5.60/mo); the text below is the architect's original reasoning._ Options: (a) 50 GB: fits the 38.6 GiB default set plus about 8 GB. (b) 60 GB: also fits the extra dev-transformer int8 (21.5 GB) experiment? No: 41.4 + 21.5 = 62.9 GB, so 60 does not; it gives about 18 GB headroom for ComfyUI caches, a second VAE or the 8.9 GB LoRA. (c) 100 GB as in SPEC: $7/mo, 2.4x the data. Recommend (b) 60 GB = $4.20/mo. Why: volumes can grow but never shrink, so start small; growing later is cheap and non-destructive. Reversibility: growing is free; shrinking means create new volume, recopy ~41 GB, re-point the endpoint (small money, real hassle). Note SPEC §7's "~$7/mo" becomes ~$4.20.
 2. **Volume layout and filenames on the volume** (same as worker.md Door 4): `<VOLUME>/models/<repo-folder>/<exact repo filename>`, `<VOLUME>/workflows/{mode}.json`. Workflows and the handler reference model files by filename; files are never renamed. Recommend: keep HF names verbatim (verified list above). Reversibility: renaming means editing every workflow JSON and re-validating; moving means recopying tens of GB.
 3. **Default model set** (what is on the volume after the first run). Options: (a) required five only (39.71 GB); (b) required + conv VAE + temporal upscaler + duration head (41.43 GB, +1.7 GB, about $0.12/mo); (c) b + 8.9 GB distilled LoRA. Recommend (b): the extra four are tiny and let the `workflows` feature choose VAE/upscaler/duration without another paid pod session; the LoRA is only useful with the dev transformer, which is excluded. Reversibility: adding later = one more pod run (cents) but is a separate session, so low cost; classified one-way only because it is bound to the volume size.
 4. **Pinned HF revision and lock file with sha256** (content identity of the weights). Options: (a) track `main` and verify size only; (b) pin commit `49b093a…` and verify sha256 from a committed lock. Recommend (b): reproducible (SPEC priority 4); a silent upstream replacement of a weight file is exactly what would otherwise surface as a baffling generation difference. Reversibility: bumping the pin is a one-line change plus `--update-lock`, but re-downloading a changed 21 GB file on the volume.
@@ -72,6 +72,7 @@ Pod recipe (documented in README, done by Ken or the `endpoint` feature): cheape
 - Free-space guard and mountpoint guard.
 
 ## Questions for Ken
+_(Answered, see "Ken's decisions" at the end of this note.)_
 1. **Volume size.** (a) 50 GB ($3.50/mo) (b) 60 GB ($4.20/mo, recommended) (c) 100 GB as in SPEC ($7/mo). Volumes only grow, never shrink, so starting small is the cheap-to-correct choice. OK with 60 GB?
 2. **Default download set.** (a) five required files, 39.7 GB (b) plus conv VAE, temporal upscaler, duration head, 41.4 GB (recommended; +$0.12/mo) (c) b plus the 8.9 GB distilled LoRA. Recommend (b).
 3. **HF access.** Have you accepted the LTX-2.x Community License on https://huggingface.co/Lightricks/LTX-2.5 with the account you will use, and do you have a read token (fine-grained: "read access to public gated repos")? Note it also shares your HF profile info with Lightricks, and the license is free only under USD 10M revenue. This is a manual step I cannot do.
@@ -135,3 +136,25 @@ Follows from Ken's decision 9 and is forced by the platform: the volume is bound
 3. Approve a read-only capacity check at US-WA-1 for a CPU pod and the RTX 6000 Ada before the volume is created, and name the fallback pod type if CPU stock is zero?
 4. Standard network volume or high-performance storage at US-WA-1: decide after one measured cold start, or accept standard for now?
 5. Is a trust-on-first-use sha256 lock acceptable, or do you want the transformer's hash cross-checked against a second source before it is committed?
+
+## Ken's decisions (2026-10-29) — binding, supersede the text above where they differ
+
+1. Network volume **80 GB** ($5.60/mo at $0.07/GB), not 60 GB; allows a transformer swap with overlap. SPEC §7 cost is corrected in the README only; SPEC.md is untouched.
+2. Default set: the five required files plus conv VAE, temporal upscaler and duration head (41.43 GB). The LoRA is optional (`--with-lora`).
+3. `--prune` is added (removes files not in the lock), and the model-bump procedure is documented (max workers 0, prune, download, verify, restore).
+4. **Standard** network volume for now; high-performance tier is decided after a measured cold start.
+5. **Trust-on-first-use sha256 lock** from the HF API, commit and its date recorded in the lock header; a second-source cross-check of the transformer hash is optional.
+6. The repo is **public**, so the temporary pod gets the script with a plain `git clone`.
+7. The HF license is accepted and the token was verified working. The token reaches the pod only as the env var `HF_TOKEN` (read-only, rotate after the run); the script never prints or logs it.
+8. `VOLUME_ROOT` is settable by flag and env (default `/runpod-volume`, else `/workspace`); the mountpoint guard is tested.
+9. ComfyUI temp/output/input never go on the volume.
+
+## Summary (Phase 7)
+
+**Built.** `scripts/download-models.sh` (bash, curl + sha256sum): downloads the pinned `Lightricks/LTX-2.5` files into `<volume>/models/<category>/` via `.partial` + `curl -C -`, verifies size and sha256, renames atomically, creates the category dirs (including empty `loras/`), and syncs `workflows/*.json`. Flags: `--verify` (read-only re-hash), `--prune [--dry-run]`, `--update-lock [--rev]`, `--workflows-only`, `--with-lora`, `--list`, `--volume-root`. Guards: volume must be a mountpoint, free space, one run per volume (flock), token and `JOBS` validation, clear 401/403 messages, refusal while any lock hash is `null`, `df -hT` printed before downloading. `scripts/models.lock` is the single source of files, sizes, sha256 and the pinned commit, and the source of model filenames for the `workflows` feature (`--list`). Offline tests (`tests/models/`, mock HF server, fake volume) run with `make -f scripts/models.mk test-models`.
+
+**Key decisions.** 80 GB standard volume at US-WA-1; verbatim HF filenames and folders; pinned commit with a TOFU sha256 lock (hashes generated 2026-10-29); own curl retry loop because curl's `--retry` restarts from byte 0; plain curl and sha256sum so a pod needs no pip packages.
+
+**Files.** `scripts/download-models.sh`, `scripts/models.lock`, `scripts/models.mk`, `tests/models/run.sh`, `tests/models/mock_hf.py`, README "Models" section, `docs/validation/models.md`.
+
+**Next steps.** Ken runs the first real download on a US-WA-1 pod, then a full `--verify`, and fills in the README "Measured" table. `HF_TOKEN` gets documented in `config.env.example` after the worker branch merges. The `workflows` feature reads filenames from the lock. The `endpoint` feature takes the volume ID from config and checks US-WA-1 capacity. Unverified until then: real gated 401/403 and CDN redirect behaviour, mountpoint on a real pod, throughput, and a hot volume resize.
