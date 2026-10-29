@@ -307,6 +307,39 @@ check "insufficient free space is refused before any download" \
   bash -c "test $RC -ne 0 && grep -q 'not enough free space' '$T/out'"
 check "free-space refusal made no download request" test "$(nreq)" = 0
 
+# free space guard against df output (stub df): RunPod's shared FUSE filesystem, a small local fs, garbage
+mkdir -p "$T/dfstub"
+cat >"$T/dfstub/df" <<'EOF'
+#!/usr/bin/env bash
+printf 'Filesystem Type 1024-blocks Used Available Capacity Mounted on\n%s\n' "$DF_STUB_LINE"
+EOF
+chmod +x "$T/dfstub/df"
+TIB_KB=$((1024 * 1024 * 1024))
+# the real line from the first RunPod run: mfs fuse 615T total, 366T used, 249T avail (249T in bytes prints as 2.7e+14 in awk)
+REAL_DF="mfs#us-wa-1.runpod.net:9421 fuse $((615 * TIB_KB)) $((366 * TIB_KB)) $((249 * TIB_KB)) 60% /runpod-volume"
+new_vol; : >"$T/req.log"
+DF_STUB_LINE=$REAL_DF PATH="$T/dfstub:$PATH" LOCK=$T/lock.good run
+check "FUSE 615T/249T: download proceeds, no arithmetic error" bash -c "test $RC = 0 && ! grep -q 'syntax error' '$T/out'"
+check "FUSE 615T: prints the shared-filesystem note" has "$T/out" "shared network filesystem (fuse)"
+check "FUSE 615T: the guard still ran (downloads happened)" test "$(nreq)" -gt 0
+new_vol; : >"$T/req.log"
+DF_STUB_LINE="mfs#us-wa-1.runpod.net:9421 fuse $((615 * TIB_KB)) $((614 * TIB_KB)) 1000 99% /runpod-volume" PATH="$T/dfstub:$PATH" LOCK=$T/lock.good run
+check "FUSE with genuinely too little free space is refused" bash -c "test $RC -ne 0 && grep -q 'not enough free space' '$T/out'"
+check "FUSE refusal made no download request" test "$(nreq)" = 0
+new_vol; : >"$T/req.log"
+DF_STUB_LINE="/dev/sdb1 ext4 83886080 1000 83000000 2% /vol" PATH="$T/dfstub:$PATH" LOCK=$T/lock.good run
+check "small local fs with room: proceeds, no network note" bash -c "test $RC = 0 && ! grep -q 'shared network filesystem' '$T/out'"
+new_vol; : >"$T/req.log"
+DF_STUB_LINE="/dev/sdb1 ext4 83886080 1000 5000 99% /vol" PATH="$T/dfstub:$PATH" LOCK=$T/lock.good run
+check "small local fs without room is refused" bash -c "test $RC -ne 0 && grep -q 'not enough free space' '$T/out'"
+new_vol; : >"$T/req.log"
+DF_STUB_LINE="garbage line without numbers" PATH="$T/dfstub:$PATH" LOCK=$T/lock.good run
+check "unparseable df output is a loud error" bash -c "test $RC -ne 0 && grep -q 'could not parse the free space' '$T/out'"
+check "unparseable df output made no download request" test "$(nreq)" = 0
+new_vol; : >"$T/req.log"
+DF_STUB_LINE="x fuse 1e+15 5 2.7e+14 60% /v" PATH="$T/dfstub:$PATH" LOCK=$T/lock.good run
+check "scientific notation in df output is refused, never evaluated" bash -c "test $RC -ne 0 && grep -q 'could not parse the free space' '$T/out'"
+
 # ================================================================ workflows
 mkdir -p "$T/wf_ok" "$T/wf_bad"
 echo '{"1": {"class_type": "X"}}' >"$T/wf_ok/t2v.json"
