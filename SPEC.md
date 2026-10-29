@@ -69,7 +69,7 @@ Job flow: UI uploads input to R2 → Worker submits `/run` with `{mode, prompt, 
 - `handler.py`:
   - Input schema: `{ "mode": "t2v"|"i2v"|"v2v", "prompt": str, "negative": str?, "input_key": str? (an R2 key under `inputs/`; required for i2v/v2v), "width": int?, "height": int?, "num_frames"/"duration": ?, "fps": int?, "seed": int? }`. Validate and apply defaults. No presigned URLs.
   - Fetches `input_key` from R2 into ComfyUI's input dir if present.
-  - Loads the matching workflow template from `/runpod-volume/workflows/{mode}.json`, fills node inputs (node IDs documented in `workflows/README.md`), submits to the in-container ComfyUI, waits for completion (websocket or polling), bounded by `JOB_TIMEOUT_S` (default 780 s, inside the 900 s platform limit).
+  - Loads the matching workflow template from `/runpod-volume/workflows/{mode}.json`, fills node inputs (node IDs documented in `workflows/README.md`), submits to the in-container ComfyUI, waits for completion (websocket or polling), bounded by `JOB_TIMEOUT_S` (default 780 s, inside the 900 s endpoint execution timeout we chose).
   - Uploads resulting mp4, a jpg thumbnail (ffmpeg, first frame) and a sidecar JSON to R2 under `outputs/<UTC date>/<YYYYMMDDTHHMMSS>-<job_id>.mp4|.jpg|.json`.
   - Returns `{ "key": ..., "thumb_key": ..., "meta_key": ..., "v": ..., "cold": ..., "duration_s": ..., "gen_time_s": ..., "seed": ..., "width": ..., "height": ..., "num_frames": ..., "fps": ... }` (effective values for width/height/num_frames/fps/seed).
   - Clear error messages back to the caller on failure (OOM, bad input, timeout), formatted `[code] message` with a separate `error_code` field.
@@ -105,7 +105,7 @@ Prefer Terraform if a maintained RunPod provider exists; otherwise a script agai
 - GPU type: RTX 6000 Ada (48 GB) at US-WA-1, fallback L40S at EU-NL-1 (verify the exact GPU ID strings RunPod's serverless API uses)
 - Workers: min **0**, max **2**
 - Idle timeout: to be set after measuring cold start (ask me before going higher — this is the knob between cold starts and idle cost)
-- Execution timeout: 15 min (900 s platform limit; the handler's `JOB_TIMEOUT_S` default is 780 s)
+- Execution timeout: 15 min (900 s, our own spend-safety choice, not a platform limit: RunPod allows 5 s to 7 days; the handler's `JOB_TIMEOUT_S` default is 780 s)
 - Network volume (80 GB, US-WA-1) attached
 - FlashBoot: on, if available for this GPU class
 - Env vars/secrets as in 4.1
