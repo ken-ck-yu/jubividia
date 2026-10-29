@@ -35,24 +35,26 @@ Default set: five required files plus the conv VAE, temporal upscaler and durati
    ```
    git clone https://github.com/ken-ck-yu/jubividia
    cd jubividia
-   scripts/download-models.sh
-   scripts/download-models.sh --verify    # optional: full re-hash afterwards
+   time scripts/download-models.sh
+   time scripts/download-models.sh --verify    # required: full re-hash of all 41 GB
    ```
-   The script finds the volume at `/runpod-volume` or `/workspace` (or use `--volume-root DIR` / env `VOLUME_ROOT`), refuses to run if that path is not a mount point (so it can never fill container disk), checks free space, downloads two files at a time into `*.partial`, verifies size and sha256, then renames atomically. Expect roughly 3-7 minutes for 41 GB. A second run downloads nothing.
-5. **Terminate** the pod (do not just stop it; a stopped pod keeps billing disk), and **rotate/revoke the HF token**.
+   Before the download starts the script prints `df -hT` for the volume: check that the size is about 80 GB and the filesystem is the network volume's, not the pod's local disk. The script finds the volume at `/runpod-volume` or `/workspace` (or use `--volume-root DIR` / env `VOLUME_ROOT`), refuses to run if that path is not a mount point (so it can never fill container disk), checks free space, downloads two files at a time into `*.partial`, verifies size and sha256, then renames atomically. Expect roughly 3-7 minutes for 41 GB plus a few minutes of hashing (unmeasured). A second run downloads nothing. Only one run per volume at a time (a lock file on the volume); a second run exits with a message. Normal runs trust file size for files already present, so the full `--verify` after the first download is what confirms every byte.
+5. **Record the first real run** in "Measured" below, then **terminate** the pod (do not just stop it; a stopped pod keeps billing disk), and **rotate/revoke the HF token**.
 
 If the mount-point check wrongly fails on a pod (a bind mount, say), confirm with `df` that the path really is the volume, then re-run with `SKIP_MOUNT_CHECK=1`.
 
 ### The sha256 lock (trust on first use)
 
-`scripts/models.lock` is committed with all sha256 fields `null` (pending) because the hashes can only be fetched with a token. While any hash is pending, the script **refuses to download or verify**. Generate them once, from any machine with a token and network (needs `python3`):
+`scripts/models.lock` is committed with the real sha256 of every file, generated on 2026-10-29 from the Hugging Face API (`lfs.oid`) at the pinned commit, trust on first use. They guard against later drift and corruption, not against a bad first fetch. Optionally cross-check the 21.5 GB transformer hash against a second source (for example the SHA256 shown on the file's page on huggingface.co while logged in). The script still refuses to download or verify if any hash is `null`.
+
+`--update-lock` is only needed for a **pin bump** (a new commit or new files in the lock). Needs `python3`, a token and network, from any machine:
 
 ```
-HF_TOKEN=... scripts/download-models.sh --update-lock
+HF_TOKEN=... scripts/download-models.sh --update-lock [--rev <commit>]
 git diff scripts/models.lock   # review, then commit
 ```
 
-The hashes come from the Hugging Face API (`lfs.oid`) at the pinned commit, so they guard against later drift or corruption, not against a bad first fetch. Optionally cross-check the 21.5 GB transformer hash against a second source before committing. `--update-lock` records the commit and its date in the lock header; `--rev <commit>` pins a different commit.
+It records the commit and its date in the lock header and leaves the lock untouched if anything fails.
 
 ### Commands
 
@@ -60,7 +62,7 @@ The hashes come from the Hugging Face API (`lfs.oid`) at the pinned commit, so t
 |---|---|
 | `scripts/download-models.sh` | Download the default set, verify, sync workflows. Idempotent and resumable (`.partial` + `curl -C -`). |
 | `--verify` | Read-only: re-hash everything on the volume against the lock. No token or network needed. |
-| `--prune [--dry-run]` | Delete files under `models/` that are not in the lock, and stray `.partial` files. |
+| `--prune [--dry-run]` | Delete files under `models/` that are not in the lock, and stray `.partial` files. **Always run `--prune --dry-run` first and read the list**: the lock is the truth, so a damaged or half-edited lock would make prune delete good files. |
 | `--update-lock [--rev C]` | Refresh sizes and sha256 in the lock from the HF API. |
 | `--workflows-only` | Copy only `workflows/*.json` to `<volume>/workflows/` (validated as JSON first). |
 | `--with-lora` | Include the optional LoRA. |
@@ -79,6 +81,21 @@ Filenames contain the version, so a bump leaves the old files behind and needs t
 5. Restore the endpoint's max workers. Update the filenames in the workflows.
 
 With 80 GB there is room for a transformer swap with overlap (41.43 + 21.5 = 62.9 GB), so pruning first is only needed for larger changes.
+
+### Measured (fill in after the first real run)
+
+| Item | Value |
+|---|---|
+| Date, pod type, datacenter | _to fill_ |
+| Download wall time (`time scripts/download-models.sh`) | _to fill_ |
+| Average download speed (41.43 GB / time) | _to fill_ |
+| Full `--verify` wall time | _to fill_ |
+| `df -hT` of the volume (size, filesystem) | _to fill_ |
+| Cold start reading the volume (from the `endpoint` feature) | _to fill_ |
+
+### Environment variables
+
+`HF_TOKEN` (read-only token, env only) and the optional `VOLUME_ROOT` are used by the script. `HF_TOKEN` is documented in `config.env.example` once the worker branch (which owns that file) is merged; this branch does not create it.
 
 ### Cost note (corrects SPEC §7)
 
