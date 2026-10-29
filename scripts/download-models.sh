@@ -158,7 +158,11 @@ explain_http() { # code url
 
 check_curl() {
   command -v curl >/dev/null || die "curl not found"
-  curl --help all 2>/dev/null | grep -q -- '--retry-all-errors' || die "curl too old (need 7.71+ for --retry-all-errors)"
+  # capture first: `curl --help all | grep -q` lets grep exit early, curl gets SIGPIPE and
+  # pipefail turns that into a false "too old"
+  local help
+  help=$(curl --help all 2>/dev/null) || true
+  [[ $help == *--retry-all-errors* ]] || die "curl too old (need 7.71+ for --retry-all-errors)"
 }
 
 # ---------------------------------------------------------------- volume
@@ -424,7 +428,7 @@ do_update_lock() {
   url="$HF_ENDPOINT/api/models/$LOCK_REPO/tree/$rev?recursive=true"
   while [[ -n $url ]]; do
     code_get "$url" "$tmp/page.$n.json" "$tmp/page.$n.hdr"
-    next=$(sed -n 's/^[Ll]ink:.*<\([^>]*\)>; *rel="next".*/\1/p' "$tmp/page.$n.hdr" | head -n1)
+    next=$(sed -n 's/^[Ll]ink:.*<\([^>]*\)>; *rel="next".*/\1/p' "$tmp/page.$n.hdr" | awk 'NR==1')   # awk reads to the end: no SIGPIPE for sed under pipefail
     if [[ -n $next && $next != "$HF_ENDPOINT"/* ]]; then die "pagination link leaves $HF_ENDPOINT; aborting (token safety)"; fi
     url=$next
     n=$((n + 1))

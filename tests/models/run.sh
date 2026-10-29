@@ -96,7 +96,7 @@ loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors 8899889568"
 check "real lock: paths and sizes match the design note" \
   test "$(awk '!/^#/&&NF{print $3, $2}' "$REAL_LOCK")" = "$expected"
 check "--list prints category, filename, path, set (tab separated)" \
-  test "$(LOCK_FILE=$REAL_LOCK "$SCRIPT" --list | head -n1 | awk -F'\t' '{print NF" "$1" "$4}')" = "4 diffusion_models default"
+  test "$(LOCK_FILE=$REAL_LOCK "$SCRIPT" --list | awk -F'\t' 'NR==1{print NF" "$1" "$4}')" = "4 diffusion_models default"
 
 new_vol
 LOCK=$T/lock.null run
