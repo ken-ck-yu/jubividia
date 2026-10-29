@@ -24,6 +24,7 @@ check("import triton", True, triton.__version__)
 import boto3  # noqa: E402
 
 check("import boto3", True, boto3.__version__)
+check("pip check", subprocess.run([sys.executable, "-m", "pip", "check"], capture_output=True).returncode == 0)
 check("ffmpeg", subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0)
 check("LTXVideo node pack present", os.path.isdir("/comfyui/custom_nodes/ComfyUI-LTXVideo"))
 check("handler installed", os.path.isfile("/handler.py"))
